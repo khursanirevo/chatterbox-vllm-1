@@ -21,7 +21,98 @@ Optimize vLLM generation parameters to achieve:
 
 ## Most Recent Work (2025-03-05 - TODAY)
 
-### ✅ CUDA MPS Parallel S3Gen - COMPLETE & PUSHED
+### ✅ TRUE T3/S3Gen CONCURRENT PROCESSING - IMPLEMENTED
+
+**Commits:** `8882c16`, `ef3301a`, `adff8d5`, `97cfbf9`, `f1c9ca9`
+
+**What Was Implemented:**
+
+**TRUE PARALLELISM:** T3 and S3Gen now run concurrently, not sequentially!
+
+**Old Architecture (Sequential):**
+```
+Request 1,2,3,4 ──> [T3: ALL together] ──> wait ──> [S3Gen: ALL together]
+                              (sequential)          (sequential but MPS)
+```
+
+**New Architecture (Concurrent):**
+```
+Request 1 ──┐
+Request 2 ──┤
+Request 3 ──┼──> [T3: vLLM continuous batching]
+Request 4 ──┘       │
+                     ├─> T3 req3 finishes ──> [MPS Worker 1] ──> Audio 3
+                     ├─> T3 req1 finishes ──> [MPS Worker 2] ──> Audio 1
+                     ├─> T3 req4 finishes ──> [MPS Worker 3] ──> Audio 4
+                     └─> T3 req2 finishes ──> [MPS Worker 4] ──> Audio 2
+```
+
+**Key Changes:**
+
+1. **Added `_process_single_request()` method** (`tts_async.py`)
+   - Each request is processed independently
+   - As soon as T3 finishes, S3Gen starts immediately
+   - No waiting for all T3 to complete
+
+2. **Refactored `generate_with_conds()`** (`tts_async.py`)
+   - Uses `asyncio.create_task()` for concurrent execution
+   - Uses `asyncio.gather()` to wait for all requests
+   - Results sorted by index for correct ordering
+
+3. **Added MPS support to streaming** (`tts_streaming.py`)
+   - `stream_audio_tokens()` now uses MPS workers
+   - Uses `pool.apply_async()` + `asyncio.to_thread()` for non-blocking calls
+   - Maintains token streaming behavior with parallel S3Gen
+
+**Benefits:**
+- Reduced total latency (T3 and S3Gen overlap)
+- Better MPS utilization (workers don't wait)
+- No artificial batching needed
+- Each request flows independently
+
+**CURRENT STATUS:**
+- ✅ Concurrent T3/S3Gen **WORKS** without MPS (0.99s for 1 request)
+- ✅ MPS workers initialize correctly
+- ✅ Streaming + MPS implemented
+- ✗ **MPS causes T3 generation to HANG** (needs debugging)
+
+**The MPS Issue:**
+- When MPS daemon is running, T3 generation hangs
+- Without MPS, everything works perfectly
+- This is a **separate issue** from the concurrent implementation
+- May be related to:
+  - MPS interference with vLLM's multiprocessing
+  - CUDA context conflicts
+  - vLLM worker initialization with MPS active
+
+**Files Modified:**
+- `src/chatterbox_vllm/tts_async.py` - Added `_process_single_request()`, refactored `generate_with_conds()`
+- `src/chatterbox_vllm/tts_streaming.py` - Added MPS support to `stream_audio_tokens()`
+- `benchmark-ttfa.py` - Updated documentation to reflect concurrent architecture
+
+**Testing:**
+```bash
+# Test WITHOUT MPS (WORKS):
+CUDA_VISIBLE_DEVICES=0 uv run python -c "
+import asyncio
+from chatterbox_vllm import ChatterboxTTSAsync
+async def test():
+    model = await ChatterboxTTSAsync.from_local(
+        '/path/to/ckpt', target_device='cuda:0', max_model_len=500
+    )
+    results = await model.generate(prompts=['Hello.'], temperature=0.8)
+    print(f'Done: {len(results)} results')
+    await model.shutdown()
+asyncio.run(test())
+"
+
+# Test WITH MPS (HANGS):
+CUDA_VISIBLE_DEVICES=0 CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps uv run python ...
+```
+
+---
+
+### ✅ CUDA MPS Parallel S3Gen - PREVIOUS WORK (COMPLETE)
 
 **Commits:** `05b0d3b`, `3fcacfb`, `fd8c58d`, `56f571e`, `bcd1ff3`
 
@@ -420,9 +511,114 @@ results = await model.generate(
 - **Result:** No benefit, sequential is faster
 - **Solution:** Use request queue and batch scheduler (architectural change)
 
+### ❌ CUDA MPS + vLLM Concurrent Processing (CURRENT ISSUE - 2025-03-05)
+- **Problem:** When MPS daemon is running, T3 generation hangs indefinitely
+- **Symptoms:**
+  - Request added to vLLM: `Added request tts_req_...`
+  - No T3 output, no errors, just hangs
+  - Timeout after 30-120 seconds
+  - NCCL warning on exit: `destroy_process_group() was not called`
+- **What Works:**
+  - ✅ Concurrent T3/S3Gen without MPS (0.99s for 1 request)
+  - ✅ Sequential processing without MPS
+  - ✅ MPS workers initialize correctly
+- **What Fails:**
+  - ✗ T3 generation with MPS active
+  - ✗ No visible error messages
+- **Hypothesis:**
+  - vLLM workers (spawn method) + MPS workers (spawn method) = conflict
+  - CUDA context contention between vLLM and MPS
+  - Possible deadlock in process initialization
+- **Status:** **BLOCKING ISSUE** - needs debugging before MPS can be used
+- **Note:** This is separate from the concurrent T3/S3Gen implementation, which works correctly
+
 ---
 
-## Next Steps (Optional Improvements)
+## Next Steps (Priority Order)
+
+### 🚨 URGENT: Debug MPS Hanging Issue (CURRENT BLOCKER)
+
+**Problem:** When MPS daemon is running, T3 generation hangs indefinitely.
+
+**What Works:**
+- ✅ Concurrent T3/S3Gen without MPS (0.99s for 1 request)
+- ✅ MPS workers initialize correctly: `[MPS] ✓ Worker pool initialized and ready`
+- ✅ Model loads successfully with MPS enabled
+
+**What Fails:**
+- ✗ T3 generation hangs after `Added request` message
+- ✗ No T3 output, no errors, just hangs
+- ✗ Timeout after 30-120 seconds
+
+**Debugging Steps:**
+
+1. **Test vLLM with MPS in isolation:**
+   ```bash
+   # Check if vLLM itself works with MPS
+   CUDA_VISIBLE_DEVICES=0 CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps uv run python -c "
+   from vllm import AsyncLLMEngine, SamplingParams
+   import asyncio
+
+   async def test():
+       engine = AsyncLLMEngine.from_engine_args(
+           model='./t3-model',
+           tokenizer='EnTokenizer',
+           tokenizer_mode='custom',
+       )
+
+       params = SamplingParams(temperature=0.8, max_tokens=100)
+       result = await engine.generate('Hello world', params)
+       print(f'T3 output: {result}')
+
+   asyncio.run(test())
+   "
+   ```
+
+2. **Check for CUDA context conflicts:**
+   ```bash
+   # See if MPS and vLLM are fighting over GPU 0
+   nvidia-smi -i 0
+
+   # Check MPS processes
+   ps aux | grep nvidia-cuda-mps
+
+   # Check CUDA MPS log
+   cat /var/log/nvidia-mps/*.log 2>/dev/null || echo "No MPS logs"
+   ```
+
+3. **Test with different MPS configurations:**
+   ```bash
+   # Try different MPS pipe directory
+   CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps-alt nvidia-cuda-mps-control -d
+
+   # Try without persistent log (workaround for log warnings)
+   CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps nvidia-cuda-mps-control -d -d
+   ```
+
+4. **Check vLLM multiprocessing settings:**
+   - Current: `VLLM_WORKER_MULTIPROC_METHOD=spawn` (forced by CUDA)
+   - Issue: May conflict with MPS's own process spawning
+   - Try: Remove or modify vllm_worker_patch.py
+
+5. **Hypothesis:** MPS daemon and vLLM workers both use `spawn` method
+   - vLLM spawns workers for tensor parallelism
+   - MPS spawns its own worker processes
+   - Possible deadlock or resource conflict
+
+**Expected Fix:**
+- Option A: Disable vLLM's internal workers (single-threaded vLLM)
+- Option B: Use fork instead of spawn for MPS workers
+- Option C: Initialize MPS before vLLM (order matters)
+- Option D: Separate GPU for MPS (not viable for single-GPU setup)
+
+**Reference Code:**
+- `src/chatterbox_vllm/vllm_worker_patch.py` - Worker initialization
+- `src/chatterbox_vllm/tts_async.py` line 224-229 - Worker patch application
+- `src/chatterbox_vllm/tts_async.py` line 129-162 - MPS pool initialization
+
+---
+
+### 1. Request Queue and Batch Scheduler (For Poisson Traffic)
 
 ### 1. Request Queue and Batch Scheduler (For Poisson Traffic)
 
@@ -690,8 +886,8 @@ a8db5aa Fix FP16 dtype mismatch and enable production use
 ---
 
 **Last Updated:** 2025-03-05
-**Status:** ✅ PRODUCTION READY - All objectives achieved + CUDA MPS implemented and pushed
-**Optimization Level:** 1.93x TTFA speedup achieved, 3-5x throughput improvement with CUDA MPS
-**Repository State:** Clean (rejected optimizations removed, CUDA MPS support added, all changes committed and pushed)
-**Profiling Complete:** Load test confirms queue time negligible (0.00%), S3Gen sequential processing WAS bottleneck (NOW FIXED with CUDA MPS for batch workloads)
-**GPU:** H200 NVL (143GB VRAM, 4 GPUs) - Perfect for CUDA MPS with multiple S3Gen instances
+**Status:** ⚠️ **MPS HANGING ISSUE** - Concurrent T3/S3Gen implemented but MPS causes T3 to hang
+**Optimization Level:** 1.93x TTFA speedup achieved, concurrent T3/S3Gen ready, MPS blocked by hanging issue
+**Repository State:** 4 commits ahead of origin/master (concurrent T3/S3Gen implementation)
+**Profiling Complete:** Load test confirms queue time negligible (0.00%), S3Gen sequential processing WAS bottleneck (NOW FIXED with concurrent processing when MPS works)
+**GPU:** H200 NVL (143GB VRAM, 4 GPUs) - Using GPU 0 only
