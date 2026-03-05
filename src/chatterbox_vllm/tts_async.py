@@ -23,6 +23,9 @@ from safetensors.torch import load_file
 
 from chatterbox_vllm.models.t3.modules.t3_config import T3Config
 
+# Import models/t3 to trigger tokenizer registration before AsyncLLMEngine
+import chatterbox_vllm.models.t3  # This registers custom tokenizers with vLLM
+
 from .models.s3tokenizer import S3_SR, drop_invalid_tokens
 from .models.s3gen import S3GEN_SR, S3Gen
 from .models.voice_encoder import VoiceEncoder
@@ -138,6 +141,19 @@ class ChatterboxTTSAsync:
         vllm_memory_percent = vllm_memory_needed / unused_gpu_memory
 
         print(f"Giving vLLM {vllm_memory_percent * 100:.2f}% of GPU memory ({vllm_memory_needed / 1024**2:.2f} MB)")
+
+        # CRITICAL: Set up sitecustomize for spawned worker processes
+        # AsyncLLMEngine spawns worker processes via 'spawn' method when CUDA is
+        # initialized. These workers are fresh Python interpreters that haven't
+        # imported chatterbox_vllm.models.t3, causing tokenizer registration to fail.
+        # This sets up PYTHONPATH to include sitecustomize.py which registers tokenizers.
+        from chatterbox_vllm.vllm_worker_patch import apply_worker_patch
+        apply_worker_patch()
+
+        # Set multiprocessing method to 'fork' (will be overridden to 'spawn' by CUDA,
+        # but the sitecustomize.py above ensures tokenizers are registered in spawned workers)
+        import os
+        os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "fork"
 
         # Create AsyncEngineArgs for AsyncLLMEngine
         engine_args = AsyncEngineArgs(
