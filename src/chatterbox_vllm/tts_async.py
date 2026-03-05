@@ -33,6 +33,15 @@ from .models.t3 import SPEECH_TOKEN_OFFSET
 from .models.t3.modules.cond_enc import T3Cond, T3CondEnc
 from .models.t3.modules.learned_pos_emb import LearnedPositionEmbeddings
 from .text_utils import punc_norm, SUPPORTED_LANGUAGES
+from .profiling import TTFAProfiler, TTFAMetrics
+from .adaptive_config import (
+    classify_request,
+    classify_request_by_chars,
+    get_profile,
+    get_priority_for_category,
+    is_adaptive_mode_enabled,
+    get_default_profile,
+)
 
 REPO_ID = "ResembleAI/chatterbox"
 
@@ -72,7 +81,8 @@ class ChatterboxTTSAsync:
                  t3_engine: AsyncLLMEngine, t3_config: T3Config, t3_cond_enc: T3CondEnc,
                  t3_speech_emb: torch.nn.Embedding, t3_speech_pos_emb: LearnedPositionEmbeddings,
                  s3gen: S3Gen, ve: VoiceEncoder, default_conds: Conditionals,
-                 variant: str = "english"):
+                 variant: str = "english",
+                 enable_ttfa_tracking: bool = False):
         self.target_device = target_device
         self.max_model_len = max_model_len
         self.t3_engine = t3_engine
@@ -86,6 +96,10 @@ class ChatterboxTTSAsync:
         self.default_conds = default_conds
         self.variant = variant
 
+        # TTFA Profiling
+        self.enable_ttfa_tracking = enable_ttfa_tracking
+        self.ttfa_profiler = TTFAProfiler() if enable_ttfa_tracking else None
+
     @property
     def sr(self) -> int:
         """Sample rate of synthesized audio"""
@@ -97,6 +111,7 @@ class ChatterboxTTSAsync:
                         max_batch_size: int = 10,
                         variant: str = "english",
                         s3gen_use_fp16: bool = False,
+                        enable_ttfa_tracking: bool = False,
                         **kwargs) -> 'ChatterboxTTSAsync':
         """
         Create ChatterboxTTSAsync from local checkpoint directory.
@@ -109,6 +124,7 @@ class ChatterboxTTSAsync:
             max_batch_size: Maximum batch size for continuous batching
             variant: Model variant ("english" or "multilingual")
             s3gen_use_fp16: Whether to use FP16 for S3Gen
+            enable_ttfa_tracking: Enable TTFA profiling and metrics collection
             **kwargs: Additional arguments for AsyncEngineArgs
 
         Returns:
@@ -187,6 +203,7 @@ class ChatterboxTTSAsync:
             t3_speech_emb=t3_speech_emb, t3_speech_pos_emb=t3_speech_pos_emb,
             s3gen=s3gen, ve=ve, default_conds=default_conds,
             variant=variant,
+            enable_ttfa_tracking=enable_ttfa_tracking,
         )
 
     @classmethod
@@ -358,9 +375,21 @@ class ChatterboxTTSAsync:
 
         This method uses continuous batching via AsyncLLMEngine to process
         multiple requests efficiently.
+
+        TTFA Tracking:
+            If enable_ttfa_tracking=True, measures and records timing for:
+            - Queue time (arrival to start)
+            - Tokenizer time
+            - T3 first token time
+            - S3 first chunk time
+            - Total TTFA
         """
         if isinstance(prompts, str):
             prompts = [prompts]
+
+        # TTFA Tracking: Record queue start time
+        queue_start = time.time() if self.enable_ttfa_tracking else None
+        tokenizer_start = None
 
         # Validate language_id
         if language_id and language_id.lower() not in self.get_supported_languages():
@@ -372,12 +401,32 @@ class ChatterboxTTSAsync:
 
         cond_emb = self.update_exaggeration(cond_emb, exaggeration)
 
+        # TTFA Tracking: Record tokenizer start
+        if self.enable_ttfa_tracking:
+            tokenizer_start = time.time()
+
         # Norm and tokenize text
         prompts = ["[START]" + punc_norm(p) + "[STOP]" for p in prompts]
 
         # For multilingual, prepend the language token
         if self.variant == "multilingual":
             prompts = [f"<{language_id.lower()}>{p}" for p in prompts]
+
+        # TTFA Tracking: Classify requests and count tokens
+        token_counts = []
+        categories = []
+        if self.enable_ttfa_tracking:
+            tokenizer = self.t3_engine.engine.tokenizer
+            for p in prompts:
+                tokens = tokenizer.encode(p)
+                token_counts.append(len(tokens))
+                # Fast classification based on tokens
+                if len(tokens) < 20:
+                    categories.append("short")
+                elif len(tokens) < 50:
+                    categories.append("medium")
+                else:
+                    categories.append("long")
 
         # Create unique request IDs for continuous batching
         request_ids = [f"tts_req_{time.time()}_{i}" for i in range(len(prompts))]
@@ -410,10 +459,22 @@ class ChatterboxTTSAsync:
 
         # Collect results as they complete (continuous batching benefit)
         start_time = time.time()
-        batch_results = []
 
-        for generator in generators:
+        # TTFA Tracking: Record T3 start and first token times
+        t3_start_times = {req_id: None for req_id in request_ids}
+        t3_first_token_times = {req_id: None for req_id in request_ids}
+
+        batch_results = []
+        for i, generator in enumerate(generators):
+            req_id = request_ids[i]
+            if t3_start_times[req_id] is None:
+                t3_start_times[req_id] = time.time()
+
             async for request_output in generator:
+                # TTFA Tracking: Record first token time
+                if self.enable_ttfa_tracking and t3_first_token_times[req_id] is None and request_output.outputs:
+                    t3_first_token_times[req_id] = time.time()
+
                 # Get the final output when request is complete
                 if request_output.finished:
                     batch_results.append(request_output)
@@ -426,9 +487,20 @@ class ChatterboxTTSAsync:
 
         # Process speech tokens to audio
         start_time = time.time()
+
+        # TTFA Tracking: S3 generation times
+        s3_start_times = {}
+        s3_first_chunk_times = {}
+
         results = []
 
         for i, request_output in enumerate(batch_results):
+            req_id = request_ids[i] if i < len(request_ids) else f"unknown_{i}"
+
+            # TTFA Tracking: Record S3 start
+            if self.enable_ttfa_tracking:
+                s3_start_times[req_id] = time.time()
+
             for output in request_output.outputs:
                 if i % 5 == 0:
                     print(f"[S3] Processing prompt {i} of {len(batch_results)}")
@@ -441,6 +513,10 @@ class ChatterboxTTSAsync:
                 speech_tokens = drop_invalid_tokens(speech_tokens)
                 speech_tokens = speech_tokens[speech_tokens < 6561]
 
+                # TTFA Tracking: Record S3 first chunk time
+                if self.enable_ttfa_tracking and req_id not in s3_first_chunk_times:
+                    s3_first_chunk_times[req_id] = time.time()
+
                 wav, _ = self.s3gen.inference(
                     speech_tokens=speech_tokens,
                     ref_dict=s3gen_ref,
@@ -451,6 +527,30 @@ class ChatterboxTTSAsync:
         s3gen_gen_time = time.time() - start_time
         print(f"[S3Gen] Waveform Generation time: {s3gen_gen_time:.2f}s")
 
+        # TTFA Tracking: Record metrics
+        if self.enable_ttfa_tracking:
+            total_end = time.time()
+            for i, req_id in enumerate(request_ids):
+                if req_id in t3_start_times and req_id in t3_first_token_times and req_id in s3_start_times:
+                    metrics = TTFAMetrics.create(
+                        request_id=req_id,
+                        input_length_tokens=token_counts[i] if i < len(token_counts) else 0,
+                        input_length_chars=len(prompts[i]) if i < len(prompts) else 0,
+                        queue_start=queue_start,
+                        tokenizer_start=tokenizer_start,
+                        t3_start=t3_start_times[req_id],
+                        t3_first_token_time=t3_first_token_times[req_id],
+                        s3_start=s3_start_times[req_id],
+                        s3_first_chunk_time=s3_first_chunk_times.get(req_id, s3_start_times[req_id]),
+                        total_end=total_end,
+                        category=categories[i] if i < len(categories) else "unknown",
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        top_p=top_p,
+                        repetition_penalty=repetition_penalty,
+                    )
+                    self.ttfa_profiler.add_metrics(metrics)
+
         return results
 
     async def shutdown(self):
@@ -459,3 +559,36 @@ class ChatterboxTTSAsync:
         # The engine will be cleaned up when the object is destroyed
         del self.t3_engine
         torch.cuda.empty_cache()
+
+    def get_ttfa_statistics(self, category: Optional[str] = None) -> dict:
+        """
+        Get TTFA statistics from the profiler.
+
+        Args:
+            category: Optional category filter ("short", "medium", "long")
+
+        Returns:
+            Dictionary with P50, P95, P99 statistics
+        """
+        if not self.enable_ttfa_tracking or self.ttfa_profiler is None:
+            return {}
+        return self.ttfa_profiler.get_statistics(category)
+
+    def print_ttfa_summary(self):
+        """Print a summary of TTFA statistics."""
+        if not self.enable_ttfa_tracking or self.ttfa_profiler is None:
+            print("TTFA tracking is not enabled.")
+            return
+        self.ttfa_profiler.print_summary()
+
+    def save_ttfa_metrics(self, filename: str = "ttfa_metrics.csv"):
+        """
+        Save TTFA metrics to CSV file.
+
+        Args:
+            filename: Output filename
+        """
+        if not self.enable_ttfa_tracking or self.ttfa_profiler is None:
+            print("TTFA tracking is not enabled.")
+            return
+        self.ttfa_profiler.save_csv(filename)

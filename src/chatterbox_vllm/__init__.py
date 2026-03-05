@@ -20,8 +20,15 @@ TokenizerRegistry.register("EnTokenizer", "chatterbox_vllm.models.t3.entokenizer
 TokenizerRegistry.register("MtlTokenizer", "chatterbox_vllm.models.t3.mtltokenizer", "MTLTokenizer")
 
 from chatterbox_vllm.tts import ChatterboxTTS
-from chatterbox_vllm.tts_async_wrapper import ChatterboxTTSAsyncWrapper
 from chatterbox_vllm.vllm_worker_patch import apply_worker_patch
+
+# Optional: Import wrapper if available
+try:
+    from chatterbox_vllm.tts_async_wrapper import ChatterboxTTSAsyncWrapper
+    _has_wrapper = True
+except (ImportError, RuntimeError):
+    _has_wrapper = False
+    ChatterboxTTSAsyncWrapper = None
 
 # Optional: Import experimental AsyncLLMEngine-based implementations
 # These require VLLM_WORKER_MULTIPROC_METHOD=fork which is incompatible with CUDA
@@ -36,9 +43,11 @@ except (ImportError, RuntimeError):
 
 __all__ = [
     "ChatterboxTTS",
-    "ChatterboxTTSAsyncWrapper",
     "apply_worker_patch",
 ]
+
+if _has_wrapper:
+    __all__.append("ChatterboxTTSAsyncWrapper")
 
 if _has_async_llm:
     __all__.extend(["ChatterboxTTSAsync", "ChatterboxTTSStreaming"])

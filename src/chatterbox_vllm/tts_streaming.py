@@ -15,6 +15,11 @@ from chatterbox_vllm.tts_async import ChatterboxTTSAsync
 from chatterbox_vllm.models.t3 import SPEECH_TOKEN_OFFSET
 from chatterbox_vllm.models.s3tokenizer import drop_invalid_tokens
 from chatterbox_vllm.text_utils import punc_norm
+from chatterbox_vllm.adaptive_config import (
+    classify_request_by_chars,
+    get_profile,
+    is_adaptive_mode_enabled,
+)
 
 
 class ChatterboxTTSStreaming(ChatterboxTTSAsync):
