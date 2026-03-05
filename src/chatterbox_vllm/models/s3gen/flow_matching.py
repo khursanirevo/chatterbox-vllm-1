@@ -101,6 +101,9 @@ class ConditionalCFM(BASECFM):
         # Or in future might add like a return_all_steps flag
         sol = []
 
+        # Use TensorRT engine if available, otherwise use PyTorch
+        use_tensorrt = hasattr(self, 'trt_engine') and self.trt_engine is not None
+
         # Do not use concat, it may cause memory format changed and trt infer with wrong results!
         x_in = torch.zeros([2, 80, x.size(2)], device=x.device, dtype=x.dtype)
         mask_in = torch.zeros([2, 1, x.size(2)], device=x.device, dtype=x.dtype)
@@ -116,12 +119,21 @@ class ConditionalCFM(BASECFM):
             t_in[:] = t.unsqueeze(0)
             spks_in[0] = spks
             cond_in[0] = cond
-            dphi_dt = self.forward_estimator(
-                x_in, mask_in,
-                mu_in, t_in,
-                spks_in,
-                cond_in
-            )
+
+            if use_tensorrt:
+                # TensorRT path
+                dphi_dt = self.forward_estimator_trt(
+                    x_in, mask_in, mu_in, t_in, spks_in, cond_in
+                )
+            else:
+                # PyTorch path
+                dphi_dt = self.forward_estimator(
+                    x_in, mask_in,
+                    mu_in, t_in,
+                    spks_in,
+                    cond_in
+                )
+
             dphi_dt, cfg_dphi_dt = torch.split(dphi_dt, [x.size(0), x.size(0)], dim=0)
             dphi_dt = ((1.0 + self.inference_cfg_rate) * dphi_dt - self.inference_cfg_rate * cfg_dphi_dt)
             x = x + dt * dphi_dt
@@ -131,6 +143,33 @@ class ConditionalCFM(BASECFM):
                 dt = t_span[step + 1] - t
 
         return sol[-1].float()
+
+    def forward_estimator_trt(self, x, mask, mu, t, spks, cond):
+        """
+        Forward estimator using TensorRT engine.
+
+        Args:
+            x: Input tensor
+            mask: Mask tensor
+            mu: Mu tensor
+            t: Timestep tensor
+            spks: Speaker embedding tensor
+            cond: Condition tensor
+
+        Returns:
+            Output tensor from TensorRT engine
+        """
+        # Call TensorRT forward
+        output = self.trt_engine.forward(
+            x=x.contiguous(),
+            mask=mask.contiguous(),
+            mu=mu.contiguous(),
+            t=t.contiguous(),
+            spks=spks.contiguous(),
+            cond=cond.contiguous(),
+        )
+
+        return output
 
     def forward_estimator(self, x, mask, mu, t, spks, cond):
         if isinstance(self.estimator, torch.nn.Module):
@@ -196,9 +235,26 @@ class ConditionalCFM(BASECFM):
 
 
 class CausalConditionalCFM(ConditionalCFM):
-    def __init__(self, in_channels=240, cfm_params=CFM_PARAMS, n_spks=1, spk_emb_dim=80, estimator=None):
+    def __init__(self, in_channels=240, cfm_params=CFM_PARAMS, n_spks=1, spk_emb_dim=80, estimator=None, tensorrt_engine_path=None):
         super().__init__(in_channels, cfm_params, n_spks, spk_emb_dim, estimator)
         self.rand_noise = torch.randn([1, 80, 50 * 300])
+
+        # Load TensorRT engine if provided
+        if tensorrt_engine_path is not None:
+            from .tensorrt_wrapper import load_tensorrt_engine, is_tensorrt_available
+
+            if not is_tensorrt_available():
+                raise ImportError(
+                    "TensorRT requested but not available. Please install:\n"
+                    "  pip install tensorrt\n"
+                    "Or remove tensorrt_engine_path parameter."
+                )
+
+            logger.info(f"[CFM] Loading TensorRT engine from {tensorrt_engine_path}...")
+            self.trt_engine = load_tensorrt_engine(tensorrt_engine_path)
+            logger.info("[CFM] ✓ TensorRT engine loaded successfully")
+        else:
+            self.trt_engine = None
 
     @torch.inference_mode()
     def forward(self, mu, mask, n_timesteps, temperature=1.0, spks=None, cond=None):

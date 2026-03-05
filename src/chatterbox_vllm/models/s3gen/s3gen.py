@@ -50,7 +50,10 @@ class S3Token2Mel(torch.nn.Module):
 
     TODO: make these modules configurable?
     """
-    def __init__(self, use_fp16: bool = False):
+    def __init__(self, use_fp16: bool = False, tensorrt_engine_path: Optional[str] = None, compile_model: bool = False):
+        # Store parameters for child classes
+        self._tensorrt_engine_path = tensorrt_engine_path
+        self._compile_model = compile_model
         super().__init__()
         self.tokenizer = S3Tokenizer("speech_tokenizer_v2_25hz")
         self.mel_extractor = mel_spectrogram # TODO: make it a torch module?
@@ -97,6 +100,7 @@ class S3Token2Mel(torch.nn.Module):
             spk_emb_dim=80,
             cfm_params=cfm_params,
             estimator=estimator,
+            tensorrt_engine_path=self._tensorrt_engine_path,
         )
 
         self.flow = CausalMaskedDiffWithXvec(
@@ -231,8 +235,8 @@ class S3Token2Wav(S3Token2Mel):
     TODO: make these modules configurable?
     """
 
-    def __init__(self, use_fp16: bool = False, compile_model: bool = False):
-        super().__init__(use_fp16=use_fp16)
+    def __init__(self, use_fp16: bool = False, compile_model: bool = False, tensorrt_engine_path: Optional[str] = None):
+        super().__init__(use_fp16=use_fp16, tensorrt_engine_path=tensorrt_engine_path, compile_model=compile_model)
 
         f0_predictor = ConvRNNF0Predictor()
         self.mel2wav = HiFTGenerator(
@@ -246,12 +250,16 @@ class S3Token2Wav(S3Token2Mel):
 
         # Apply torch.compile() for optimization (30-40% speedup)
         # Note: Requires warmup runs for optimal performance
-        if compile_model:
+        # Note: torch.compile() is mutually exclusive with TensorRT
+        if compile_model and tensorrt_engine_path is None:
             print("[S3Gen] Compiling flow model with torch.compile()...")
             self.flow = torch.compile(self.flow, mode="reduce-overhead", fullgraph=False)
             print("[S3Gen] Compiling mel2wav model with torch.compile()...")
             self.mel2wav = torch.compile(self.mel2wav, mode="reduce-overhead", fullgraph=False)
             print("[S3Gen] Model compilation complete. Warmup runs will be performed during first inference.")
+        elif tensorrt_engine_path is not None:
+            print(f"[S3Gen] Using TensorRT engine from {tensorrt_engine_path}")
+            print("[S3Gen] ⚠ torch.compile() is disabled when using TensorRT")
 
         # silence out a few ms and fade audio in to reduce artifacts
         n_trim = S3GEN_SR // 50  # 20ms = half of a frame
