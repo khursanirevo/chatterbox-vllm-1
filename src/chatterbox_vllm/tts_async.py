@@ -364,7 +364,7 @@ class ChatterboxTTSAsync:
         temperature: float = 0.8,
         exaggeration: float = 0.5,
         max_tokens=1000,
-        diffusion_steps: int = 10,
+        diffusion_steps: int = 5,
         top_p=1.0,
         min_p=0.05,
         repetition_penalty=2.0,

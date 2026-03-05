@@ -49,7 +49,7 @@ class ChatterboxTTSStreaming(ChatterboxTTSAsync):
         exaggeration: float = 0.5,
         temperature: float = 0.8,
         max_tokens: int = 1000,
-        diffusion_steps: int = 10,
+        diffusion_steps: int = 5,
         top_p: float = 1.0,
         repetition_penalty: float = 2.0,
     ) -> AsyncGenerator[torch.Tensor, None]:
@@ -200,7 +200,7 @@ class ChatterboxTTSStreaming(ChatterboxTTSAsync):
         exaggeration: float = 0.5,
         temperature: float = 0.8,
         max_tokens: int = 1000,
-        diffusion_steps: int = 10,
+        diffusion_steps: int = 5,
         top_p: float = 1.0,
         repetition_penalty: float = 2.0,
         return_full_audio: bool = True,
