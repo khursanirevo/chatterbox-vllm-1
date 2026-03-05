@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Optional, Union, Tuple, Any, AsyncGenerator
 import time
 import asyncio
+import os
 
 from vllm import AsyncLLMEngine, SamplingParams
 from vllm.engine.arg_utils import AsyncEngineArgs
@@ -22,6 +23,14 @@ from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
 
 from chatterbox_vllm.models.t3.modules.t3_config import T3Config
+
+# CUDA MPS multiprocessing support
+try:
+    from multiprocessing import Pool
+    MPS_AVAILABLE = True
+except ImportError:
+    MPS_AVAILABLE = False
+    Pool = None
 
 # Import models/t3 to trigger tokenizer registration before AsyncLLMEngine
 import chatterbox_vllm.models.t3  # This registers custom tokenizers with vLLM
@@ -82,7 +91,8 @@ class ChatterboxTTSAsync:
                  t3_speech_emb: torch.nn.Embedding, t3_speech_pos_emb: LearnedPositionEmbeddings,
                  s3gen: S3Gen, ve: VoiceEncoder, default_conds: Conditionals,
                  variant: str = "english",
-                 enable_ttfa_tracking: bool = False):
+                 enable_ttfa_tracking: bool = False,
+                 ckpt_dir: Optional[str] = None):
         self.target_device = target_device
         self.max_model_len = max_model_len
         self.t3_engine = t3_engine
@@ -100,10 +110,56 @@ class ChatterboxTTSAsync:
         self.enable_ttfa_tracking = enable_ttfa_tracking
         self.ttfa_profiler = TTFAProfiler() if enable_ttfa_tracking else None
 
+        # CUDA MPS: Store checkpoint directory for multiprocessing workers
+        self.ckpt_dir = str(ckpt_dir) if ckpt_dir else None
+
+        # Store S3Gen configuration for multiprocessing workers
+        self.s3gen_use_fp16 = s3gen.use_fp16 if hasattr(s3gen, 'use_fp16') else False
+        self.s3gen_compile_model = s3gen._compile_model if hasattr(s3gen, '_compile_model') else False
+
+        # CUDA MPS: Initialize persistent worker pool
+        self.mps_pool = None
+        self._init_mps_pool_if_enabled()
+
     @property
     def sr(self) -> int:
         """Sample rate of synthesized audio"""
         return S3GEN_SR
+
+    def _init_mps_pool_if_enabled(self):
+        """
+        Initialize MPS worker pool if CUDA MPS is enabled.
+
+        This creates a persistent pool of worker processes that will be reused
+        across multiple generate() calls, avoiding the overhead of recreating
+        workers for each batch.
+        """
+        import os
+        if not os.environ.get('CUDA_MPS_PIPE_DIRECTORY'):
+            return
+
+        if not self.ckpt_dir:
+            print("[MPS] ckpt_dir not set, skipping worker pool initialization")
+            print("[MPS] Use from_local() or from_pretrained() to enable MPS")
+            return
+
+        try:
+            from .s3gen_mps_worker import _init_worker
+
+            print(f"[MPS] Initializing persistent worker pool (4 workers)...")
+            self.mps_pool = Pool(
+                processes=4,
+                initializer=_init_worker,
+                initargs=(self.ckpt_dir, self.s3gen_use_fp16, self.s3gen_compile_model, "cuda:0"),
+            )
+            print("[MPS] ✓ Worker pool initialized and ready")
+
+        except Exception as e:
+            print(f"[MPS] Failed to initialize worker pool: {e}")
+            print("[MPS] Will fall back to sequential processing")
+            import traceback
+            traceback.print_exc()
+            self.mps_pool = None
 
     @classmethod
     async def from_local(cls, ckpt_dir: str | Path, target_device: str = "cuda",
@@ -209,6 +265,7 @@ class ChatterboxTTSAsync:
             s3gen=s3gen, ve=ve, default_conds=default_conds,
             variant=variant,
             enable_ttfa_tracking=enable_ttfa_tracking,
+            ckpt_dir=ckpt_dir,  # Pass checkpoint directory for MPS workers
         )
 
     @classmethod
@@ -497,40 +554,135 @@ class ChatterboxTTSAsync:
         s3_start_times = {}
         s3_first_chunk_times = {}
 
+        # Check if MPS is enabled
+        import os
+        mps_enabled = os.environ.get('CUDA_MPS_PIPE_DIRECTORY') is not None
+
+        # Check if we should use multiprocessing (only if MPS is enabled and enough requests)
+        use_multiprocessing = mps_enabled and len(batch_results) >= 4
+
         results = []
 
-        for i, request_output in enumerate(batch_results):
-            req_id = request_ids[i] if i < len(request_ids) else f"unknown_{i}"
+        if use_multiprocessing:
+            # MULTIPROCESSING with MPS: Process requests in parallel using multiple processes
+            print(f"[S3] Using MULTIPROCESSING with CUDA MPS ({len(batch_results)} requests)")
 
-            # TTFA Tracking: Record S3 start
-            if self.enable_ttfa_tracking:
-                s3_start_times[req_id] = time.time()
+            # Import worker functions
+            from .s3gen_mps_worker import _init_worker, _run_s3gen_worker
 
-            for output in request_output.outputs:
-                if i % 5 == 0:
-                    print(f"[S3] Processing prompt {i} of {len(batch_results)}")
+            # Check if ckpt_dir is available
+            if self.ckpt_dir is None:
+                print("[S3] WARNING: ckpt_dir not set, falling back to sequential processing")
+                print("[S3] Use from_local() or from_pretrained() to enable MPS parallelism")
+                use_multiprocessing = False
+            else:
+                # Prepare tasks for workers
+                s3gen_tasks = []
+                for i, request_output in enumerate(batch_results):
+                    req_id = request_ids[i] if i < len(request_ids) else f"unknown_{i}"
 
-                # Run gc every 10 prompts
-                if i % 10 == 0:
-                    torch.cuda.empty_cache()
+                    # TTFA Tracking: Record S3 start
+                    if self.enable_ttfa_tracking:
+                        s3_start_times[req_id] = time.time()
 
-                speech_tokens = torch.tensor([token - SPEECH_TOKEN_OFFSET for token in output.token_ids], device="cuda")
-                speech_tokens = drop_invalid_tokens(speech_tokens)
-                speech_tokens = speech_tokens[speech_tokens < 6561]
+                    for output in request_output.outputs:
+                        speech_tokens = torch.tensor([token - SPEECH_TOKEN_OFFSET for token in output.token_ids], device="cuda")
+                        speech_tokens = drop_invalid_tokens(speech_tokens)
+                        speech_tokens = speech_tokens[speech_tokens < 6561]
 
-                # TTFA Tracking: Record S3 first chunk time
-                if self.enable_ttfa_tracking and req_id not in s3_first_chunk_times:
-                    s3_first_chunk_times[req_id] = time.time()
+                        # Convert to numpy for multiprocessing
+                        speech_tokens_np = speech_tokens.detach().cpu().numpy()
+                        ref_dict_np = {k: v.detach().cpu().numpy() if torch.is_tensor(v) else v for k, v in s3gen_ref.items()}
 
-                wav, _ = self.s3gen.inference(
-                    speech_tokens=speech_tokens,
-                    ref_dict=s3gen_ref,
-                    n_timesteps=diffusion_steps,
-                )
-                results.append(wav.cpu())
+                        s3gen_tasks.append({
+                            'speech_tokens': speech_tokens_np,
+                            'ref_dict': ref_dict_np,
+                            'n_timesteps': diffusion_steps,
+                            'index': len(s3gen_tasks),
+                        })
 
-        s3gen_gen_time = time.time() - start_time
-        print(f"[S3Gen] Waveform Generation time: {s3gen_gen_time:.2f}s")
+                print(f"[S3] Created {len(s3gen_tasks)} tasks for {len(batch_results)} requests")
+
+                # Use persistent pool if available, otherwise fall back to sequential
+                if self.mps_pool is None:
+                    print("[S3] WARNING: Persistent pool not available, falling back to sequential")
+                    print("[S3] (Pool may have failed to initialize during model loading)")
+                    use_multiprocessing = False
+                else:
+                    try:
+                        from .s3gen_mps_worker import _run_s3gen_worker
+                        worker_results = self.mps_pool.map(_run_s3gen_worker, s3gen_tasks)
+
+                        # Collect results in order
+                        results_dict = {r['index']: r for r in worker_results}
+
+                        for i in range(len(s3gen_tasks)):
+                            result = results_dict.get(i)
+                            if result.get('error'):
+                                print(f"[S3] ERROR in task {i}: {result['error']}")
+                                # Create fallback audio (1 second of silence)
+                                results.append(torch.zeros(1, 24000))
+                            else:
+                                # Convert numpy back to torch tensor
+                                results.append(torch.from_numpy(result['wav']))
+
+                        s3gen_gen_time = time.time() - start_time
+                        print(f"[S3Gen] Waveform Generation time (MPS parallel): {s3gen_gen_time:.2f}s")
+
+                        # Skip the sequential processing block
+                        batch_results = None  # Signal to skip sequential processing
+
+                    except Exception as e:
+                        print(f"[S3] ERROR in multiprocessing: {e}")
+                        print(f"[S3] Falling back to sequential processing")
+                        import traceback
+                        traceback.print_exc()
+                        use_multiprocessing = False
+                        results = []
+                        batch_results = batch_results  # Restore batch_results for sequential processing
+
+        # Sequential processing (fallback or for small batches)
+        if batch_results is not None:
+            # Process requests one at a time
+            if mps_enabled and len(batch_results) < 4:
+                print(f"[S3] Using sequential processing (MPS enabled but < 4 requests)")
+            elif not mps_enabled:
+                print(f"[S3] Using sequential processing (MPS not enabled)")
+            else:
+                print(f"[S3] Using sequential processing (multiprocessing failed or not available)")
+
+            for i, request_output in enumerate(batch_results):
+                req_id = request_ids[i] if i < len(request_ids) else f"unknown_{i}"
+
+                # TTFA Tracking: Record S3 start
+                if self.enable_ttfa_tracking and req_id not in s3_start_times:
+                    s3_start_times[req_id] = time.time()
+
+                for output in request_output.outputs:
+                    if i % 5 == 0:
+                        print(f"[S3] Processing prompt {i} of {len(batch_results)}")
+
+                    # Run gc every 10 prompts
+                    if i % 10 == 0:
+                        torch.cuda.empty_cache()
+
+                    speech_tokens = torch.tensor([token - SPEECH_TOKEN_OFFSET for token in output.token_ids], device="cuda")
+                    speech_tokens = drop_invalid_tokens(speech_tokens)
+                    speech_tokens = speech_tokens[speech_tokens < 6561]
+
+                    # TTFA Tracking: Record S3 first chunk time
+                    if self.enable_ttfa_tracking and req_id not in s3_first_chunk_times:
+                        s3_first_chunk_times[req_id] = time.time()
+
+                    wav, _ = self.s3gen.inference(
+                        speech_tokens=speech_tokens,
+                        ref_dict=s3gen_ref,
+                        n_timesteps=diffusion_steps,
+                    )
+                    results.append(wav.cpu())
+
+            s3gen_gen_time = time.time() - start_time
+            print(f"[S3Gen] Waveform Generation time: {s3gen_gen_time:.2f}s")
 
         # TTFA Tracking: Record metrics
         if self.enable_ttfa_tracking:
@@ -560,6 +712,14 @@ class ChatterboxTTSAsync:
 
     async def shutdown(self):
         """Shutdown the AsyncLLMEngine and clean up resources."""
+        # Shutdown MPS worker pool if exists
+        if self.mps_pool is not None:
+            print("[MPS] Shutting down worker pool...")
+            self.mps_pool.close()
+            self.mps_pool.join()
+            self.mps_pool = None
+            print("[MPS] ✓ Worker pool shut down")
+
         # Note: AsyncLLMEngine doesn't have an explicit shutdown method in some versions
         # The engine will be cleaned up when the object is destroyed
         del self.t3_engine
