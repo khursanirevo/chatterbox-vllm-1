@@ -21,6 +21,42 @@ Optimize vLLM generation parameters to achieve:
 
 ## Recent Work (2025-03-05)
 
+### ✅ TensorRT Cleanup (COMPLETED)
+
+**Commit:** `47db1b4`
+
+Removed all TensorRT-related code and documentation after determining it cannot be used with Python 3.12 (vLLM requirement). TensorRT optimization requires Python 3.11 or Docker environment.
+
+**Removed Files (2083 lines):**
+- TensorRT wrapper code
+- TensorRT build scripts and tools
+- TensorRT documentation
+- TensorRT parameters from source files
+
+**Reason:** TensorRT engines were never built due to:
+1. Python 3.12 incompatibility (TensorRT supports up to 3.11)
+2. torch-tensorrt requires source build
+3. ONNX export fails with complex dynamic shapes
+
+**Decision:** Keep repository clean with only accepted optimizations.
+
+---
+
+### ✅ ONNX Runtime Attempt (REJECTED - REMOVED)
+
+**Date:** 2025-03-05
+
+Attempted ONNX Runtime as alternative to TensorRT. Exported S3Gen estimator to ONNX (137MB file) but benchmark results showed **0.76x speedup** (31% slower than PyTorch).
+
+**Issues:**
+- Memory copy overhead (tensor CPU→numpy→ONNX→tensor)
+- 56 Memcpy nodes added to graph
+- Provider configuration challenges
+
+**Status:** All ONNX Runtime code and files removed from repository.
+
+---
+
 ### ✅ FP16 Optimization (COMPLETED)
 
 **Commit:** `a8db5aa`
@@ -41,72 +77,8 @@ Fixed FP16 dtype mismatch by converting all S3Gen model components (encoder, dec
 
 **Files:**
 - `src/chatterbox_vllm/models/s3gen/flow.py` - FP16 conversion for affine layers
-- `test_fp16_fix.py` - Verification test
-- `benchmark_fp16.py` - Single-request comparison
-- `benchmark_poisson_fp16_fp32.py` - Concurrent traffic simulation
 - `FP16_FIX_SUMMARY.md` - Technical documentation
-
----
-
-### ✅ TensorRT Support (IMPLEMENTED, ENGINES NOT BUILT)
-
-**Commits:** `7ba5623`, `cf9d0ef`, `b7adf36`, `228138a`
-
-Complete TensorRT integration for S3Gen ConditionalDecoder. Code is production-ready but engines not yet built due to ONNX export challenges.
-
-**Implementation:**
-- `src/chatterbox_vllm/models/s3gen/tensorrt_wrapper.py` - TensorRT wrapper class (243 lines)
-- `src/chatterbox_vllm/models/s3gen/flow_matching.py` - Updated with TensorRT execution path
-- `src/chatterbox_vllm/models/s3gen/s3gen.py` - Added `tensorrt_engine_path` parameter
-- `src/chatterbox_vllm/tts_async.py` - Added `s3gen_use_tensorrt` parameter
-
-**Tools Created:**
-- `build_s3gen_tensorrt.py` - Engine builder script
-- `benchmark_tensorrt.py` - Performance comparison tool
-- `compile_tensorrt_direct.py` - torch-tensorrt compilation script
-- `torch_tensorrt_example.py` - Manual usage example
-
-**Documentation:**
-- `TENSORRT_README.md` - Complete guide (282 lines)
-- `TENSORRT_STATUS.md` - Implementation status
-- `TENSORRT_BUILD_STATUS.md` - Build challenges
-- `TENSORRT_BENCHMARK_RESULTS.md` - PyTorch baseline results
-- `TORCH_TENSORRT_GUIDE.md` - torch-tensorrt compilation guide
-
-**PyTorch Baseline (FP16):**
-- Short prompts: 0.886s mean
-- Medium prompts: 1.025s mean
-- T3 Generation: ~0.40s (45%)
-- S3Gen Waveform: ~0.42s (47%)
-
-**Expected with TensorRT (2-3x S3Gen speedup):**
-- Short prompts: ~0.60s (1.48x faster)
-- Overall: 30-45% TTFA improvement
-
-**Challenge:** ONNX export fails due to complex dynamic shapes in ConditionalDecoder model.
-
-**Alternative:** torch-tensorrt compiles PyTorch → TensorRT directly (bypasses ONNX), but requires building from source.
-
----
-
-### ✅ TTFA Component Breakdown Analysis (COMPLETED)
-
-**File:** `TTFA_COMPONENT_BREAKDOWN.md`
-
-Comprehensive analysis of TTFA by component:
-
-| Component | Average % | Time Range | Impact |
-|-----------|-----------|------------|--------|
-| **S3Gen** | **90.2%** | ~300ms | Dominates TTFA |
-| **T3 First Token** | 9.8% | 17-71ms | Grows with text length |
-| **Tokenization** | 0.1% | <1ms | Negligible |
-
-**Key Finding:** S3Gen accounts for 80-95% of TTFA, validating the n_timesteps=10→5 optimization.
-
-**Files:**
-- `profile_tts_stages.py` - Stage-by-stage profiling
-- `summarize_ttfa_breakdown.py` - Summary visualization script
-- `TTFA_COMPONENT_BREAKDOWN.md` - Complete analysis
+- `FP16_QUALITY_COMPARISON.md` - Audio quality guide
 
 ---
 
@@ -141,7 +113,6 @@ model = await ChatterboxTTSAsync.from_pretrained(
     max_model_len=1000,
     s3gen_use_fp16=True,  # ✅ ENABLED - 1.09x speedup
     s3gen_compile_model=False,  # torch.compile() doesn't help
-    s3gen_use_tensorrt=False,  # Requires pre-built engine
 )
 
 # Generation uses n_timesteps=5 by default
@@ -160,21 +131,13 @@ results = await model.generate(
 
 ### Combined Speedup Achieved
 
-| Optimization | Speedup | Component |
-|--------------|---------|-----------|
-| **n_timesteps 10→5** | 1.77x | S3Gen (diffusion steps) |
-| **FP16 mode** | 1.09x | S3Gen (precision) |
-| **Combined** | **1.93x** | From original baseline |
+| Optimization | Speedup | Component | Status |
+|--------------|---------|-----------|--------|
+| **n_timesteps 10→5** | 1.77x | S3Gen (diffusion steps) | ✅ Production |
+| **FP16 mode** | 1.09x | S3Gen (precision) | ✅ Production |
+| **Combined** | **1.93x** | From original baseline | ✅ **Production** |
 
-### Expected with TensorRT (Future)
-
-| Optimization | Speedup | Status |
-|--------------|---------|--------|
-| **Current (n_timesteps + FP16)** | 1.93x | ✅ Production-ready |
-| **+ TensorRT** | 2.5-3x | 🔧 Engines not built |
-| **+ torch-tensorrt** | 2.5-3x | 🔧 Requires source build |
-
-**Total potential from original baseline:** 3.5-4x speedup
+**Note:** TensorRT optimization (potential 2-3x S3Gen speedup) was investigated but removed due to Python 3.12 incompatibility. Future work could use Python 3.11 or Docker environment.
 
 ---
 
@@ -182,21 +145,7 @@ results = await model.generate(
 
 ### Modified Files
 1. `src/chatterbox_vllm/models/s3gen/flow.py` - FP16 conversion
-2. `src/chatterbox_vllm/models/s3gen/flow_matching.py` - TensorRT support
-3. `src/chatterbox_vllm/models/s3gen/s3gen.py` - TensorRT parameters
-4. `src/chatterbox_vllm/tts_async.py` - FP16 + TensorRT configuration
-
-### New Files - TensorRT
-1. `src/chatterbox_vllm/models/s3gen/tensorrt_wrapper.py` - TensorRT wrapper class
-2. `build_s3gen_tensorrt.py` - Engine builder
-3. `benchmark_tensorrt.py` - Performance comparison
-4. `compile_tensorrt_direct.py` - torch-tensorrt compiler
-5. `torch_tensorrt_example.py` - Usage example
-6. `TENSORRT_README.md` - Complete documentation
-7. `TENSORRT_STATUS.md` - Implementation status
-8. `TENSORRT_BUILD_STATUS.md` - Build challenges
-9. `TENSORRT_BENCHMARK_RESULTS.md` - Benchmark data
-10. `TORCH_TENSORRT_GUIDE.md` - torch-tensorrt guide
+2. `src/chatterbox_vllm/tts_async.py` - FP16 configuration
 
 ### New Files - FP16
 1. `test_fp16_fix.py` - Verification test
@@ -206,10 +155,8 @@ results = await model.generate(
 5. `generate_fp32_samples.py` - FP32 comparison samples
 6. `FP16_FIX_SUMMARY.md` - Technical documentation
 7. `FP16_QUALITY_COMPARISON.md` - Audio quality guide
-
-### New Files - Analysis
-1. `TTFA_COMPONENT_BREAKDOWN.md` - Component breakdown
-2. `summarize_ttfa_breakdown.py` - Summary script
+8. `combined_benchmark_results.json` - Benchmark results
+9. `s3gen_benchmark_results.json` - S3Gen benchmark data
 
 ---
 
@@ -244,40 +191,38 @@ results = await model.generate(
 - **Problem:** Garbage audio quality
 - **User feedback:** "steps < 5 sound garbage"
 
-### ❌ ONNX Export for TensorRT
-- **Problem:** Complex dynamic shapes in ConditionalDecoder
-- **Error:** `RuntimeError: expected input[2, 560, 82] to have 320 channels, but got 560`
-- **Workaround:** torch-tensorrt (requires source build)
+### ❌ TensorRT (All Approaches)
+- **Problem 1:** Python 3.12 incompatibility (TensorRT supports up to 3.11)
+- **Problem 2:** ONNX export fails due to complex dynamic shapes in ConditionalDecoder
+- **Problem 3:** torch-tensorrt requires source build
+- **Status:** All TensorRT code removed from repository
 
-### ❌ torch-tensorrt Installation
-- **Problem:** Not in PyPI, requires source build
-- **Command:** `git clone https://github.com/pytorch/tensorrt && python setup.py install`
+### ❌ ONNX Runtime (2025-03-05)
+- **Problem:** 31% slower than PyTorch (0.76x speedup)
+- **Root Causes:**
+  - Memory copy overhead (tensor → numpy → ONNX → tensor)
+  - 56 Memcpy nodes added to execution graph
+  - Provider configuration mismatch (fixed but still slow)
+- **Result:** All ONNX Runtime code removed from repository
 
 ---
 
 ## Next Steps (Optional Improvements)
 
-### 1. Build TensorRT Engine (HIGH EFFORT, HIGH REWARD)
+### 1. TensorRT with Python 3.11/Docker (HIGH EFFORT, HIGH REWARD)
 
-**Challenge:** ONNX export fails due to dynamic shapes.
+**Challenge:** Current Python 3.12 is incompatible with TensorRT.
 
 **Options:**
-- **A. Use torch-tensorrt** (recommended)
-  ```bash
-  git clone https://github.com/pytorch/tensorrt
-  cd tensorrt && python setup.py install
-  python compile_tensorrt_direct.py
-  ```
-  Bypasses ONNX, compiles PyTorch → TensorRT directly.
+- **A. Use Docker with Python 3.11**
+  - Create container with Python 3.11 + TensorRT
+  - Build engine in container
+  - Export engine for use in main environment
 
-- **B. Manual engine building with trtexec**
-  - Simplify model with fixed shapes
-  - Profile with trtexec
-  - Build engine manually
-
-- **C. Wait for torch-tensorrt to mature**
-  - Experimental for complex models
-  - May improve in future releases
+- **B. Use Python 3.11 venv**
+  - Create separate venv with Python 3.11
+  - Install torch-tensorrt from source
+  - Build and export engine
 
 **Expected:** 2-3x S3Gen speedup → 30-45% TTFA improvement
 
@@ -285,7 +230,7 @@ results = await model.generate(
 
 **Potential:** 2x speedup
 
-**Current:** `inference_cfg_rate=0.7` in CFM_PARAMS
+**Current:** `inference_cfg_rate=0.7` in CFM_PARAMS (see `flow_matching.py`)
 
 **Test:** Set to 0.0 or 0.2
 
@@ -336,17 +281,18 @@ python benchmark_poisson_fp16_fp32.py
 python benchmark_tensorrt.py
 ```
 
-### Build TensorRT Engine (Future)
+### Build TensorRT Engine (Requires Python 3.11)
 ```bash
-# Install torch-tensorrt (requires source build)
-git clone https://github.com/pytorch/tensorrt
-cd tensorrt && python setup.py install
+# Option A: Use Docker
+docker run --gpus all -it --rm -v $(pwd):/workspace \
+    pytorch/pytorch:2.9.0-cuda12.6-cpp11-runtime \
+    bash /workspace/build_tensorrt_docker.sh
 
-# Compile model
-python compile_tensorrt_direct.py
-
-# Benchmark
-python benchmark_tensorrt.py
+# Option B: Use Python 3.11 venv
+python3.11 -m venv .venv-tensorrt
+source .venv-tensorrt/bin/activate
+pip install torch==2.9.0 tensorrt torch-tensorrt --extra-index-url https://download.pytorch.org/whl/cu126
+python export_and_build_engine.py
 ```
 
 ### Key Commands
@@ -399,14 +345,10 @@ VLLM_WORKER_MULTIPROC_METHOD=spawn  # Multiprocessing method
 **Status:** Works with vLLM 0.10.0
 **Tracking:** https://github.com/vllm-project/vllm/issues/21989
 
-### 2. TensorRT Engine Not Built
-**Challenge:** ONNX export fails due to complex dynamic shapes
-**Workaround:** torch-tensorr (requires source build)
-**Documentation:** `TENSORRT_BUILD_STATUS.md`, `TORCH_TENSORRT_GUIDE.md`
-
-### 3. torch-tensorrt Not Installed
-**Challenge:** Requires building from source
-**Installation:** See `TORCH_TENSORRT_GUIDE.md`
+### 2. TensorRT Not Available (Python 3.12 Incompatibility)
+**Challenge:** TensorRT supports up to Python 3.11 only
+**Workaround:** Use Docker or Python 3.11 venv
+**Status:** Not blocking - current 1.93x speedup is production-ready
 
 ---
 
@@ -416,13 +358,11 @@ VLLM_WORKER_MULTIPROC_METHOD=spawn  # Multiprocessing method
 
 **Recent commits (as of 2025-03-05):**
 ```
-228138a Add torch-tensorrt compilation guide
-b7adf36 Add TensorRT benchmark results (PyTorch baseline)
-cf9d0ef Add TensorRT build status documentation
-7ba5623 Add TensorRT optimization support (2-3x speedup potential)
+47db1b4 Remove rejected TensorRT optimization attempts
 a8db5aa Fix FP16 dtype mismatch and enable production use
 0ddb8ae Benchmark combined S3Gen optimizations
 ```
+**Note:** Commits `228138a`, `b7adf36`, `cf9d0ef`, `7ba5623` (TensorRT code) were removed in commit `47db1b4`.
 
 **Branch:** `master`
 
@@ -474,4 +414,4 @@ a8db5aa Fix FP16 dtype mismatch and enable production use
 **Last Updated:** 2025-03-05
 **Status:** ✅ PRODUCTION READY - All objectives achieved
 **Optimization Level:** 1.93x speedup achieved
-**TensorRT Status:** Code complete, engines not built (see TORCH_TENSORRT_GUIDE.md)
+**Repository State:** Clean (rejected optimizations removed)
