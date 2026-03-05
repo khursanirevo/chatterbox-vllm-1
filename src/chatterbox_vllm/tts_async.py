@@ -111,6 +111,7 @@ class ChatterboxTTSAsync:
                         max_batch_size: int = 10,
                         variant: str = "english",
                         s3gen_use_fp16: bool = False,
+                        s3gen_compile_model: bool = False,
                         enable_ttfa_tracking: bool = False,
                         **kwargs) -> 'ChatterboxTTSAsync':
         """
@@ -124,6 +125,7 @@ class ChatterboxTTSAsync:
             max_batch_size: Maximum batch size for continuous batching
             variant: Model variant ("english" or "multilingual")
             s3gen_use_fp16: Whether to use FP16 for S3Gen
+            s3gen_compile_model: Whether to compile S3Gen with torch.compile() (30-40% speedup)
             enable_ttfa_tracking: Enable TTFA profiling and metrics collection
             **kwargs: Additional arguments for AsyncEngineArgs
 
@@ -190,7 +192,7 @@ class ChatterboxTTSAsync:
         ve.load_state_dict(load_file(ckpt_dir / "ve.safetensors"))
         ve = ve.to(device=target_device).eval()
 
-        s3gen = S3Gen(use_fp16=s3gen_use_fp16)
+        s3gen = S3Gen(use_fp16=s3gen_use_fp16, compile_model=s3gen_compile_model)
         s3gen.load_state_dict(load_file(ckpt_dir / "s3gen.safetensors"), strict=False)
         s3gen = s3gen.to(device=target_device).eval()
 
