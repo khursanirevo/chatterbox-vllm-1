@@ -1,0 +1,80 @@
+{
+  "timestamp": "2026-03-05T20:50:41.393356",
+  "gpu": "NVIDIA H200 NVL",
+  "parameters": {
+    "num_requests": 50,
+    "avg_requests_per_second": 2.0
+  },
+  "sequential": {
+    "mode": "Sequential",
+    "total_requests": 50,
+    "successful": 50,
+    "failed": 0,
+    "success_rate": 100.0,
+    "avg_queue_time": 0.0703836455205501,
+    "p95_queue_time": 0.2111712596598352,
+    "p99_queue_time": 0.622351181900203,
+    "avg_generation_time": 0.8875708627700806,
+    "p95_generation_time": 1.6545968055725098,
+    "p99_generation_time": 1.683673620223999,
+    "avg_total_time": 14.453168954849243,
+    "p95_total_time": 31.24364137649536,
+    "p99_total_time": 33.04529881477356,
+    "by_category": {
+      "short": {
+        "count": 18,
+        "avg_gen_time": 0.5823340548409356,
+        "p95_gen_time": 1.3417189121246338,
+        "avg_total_time": 13.114978816774157
+      },
+      "medium": {
+        "count": 23,
+        "avg_gen_time": 0.9378249852553658,
+        "p95_gen_time": 1.2169339656829834,
+        "avg_total_time": 14.366500927054364
+      },
+      "long": {
+        "count": 9,
+        "avg_gen_time": 1.3696172767215304,
+        "p95_gen_time": 1.683673620223999,
+        "avg_total_time": 17.351034190919663
+      }
+    }
+  },
+  "mps_parallel": {
+    "mode": "MPS",
+    "total_requests": 50,
+    "successful": 50,
+    "failed": 0,
+    "success_rate": 100.0,
+    "avg_queue_time": 0.29676067493949543,
+    "p95_queue_time": 2.1651175397779516,
+    "p99_queue_time": 2.443845876676063,
+    "avg_generation_time": 1.2402793502807616,
+    "p95_generation_time": 2.5906689167022705,
+    "p99_generation_time": 3.0975217819213867,
+    "avg_total_time": 15.03225447177887,
+    "p95_total_time": 31.25056219100952,
+    "p99_total_time": 33.12655544281006,
+    "by_category": {
+      "short": {
+        "count": 18,
+        "avg_gen_time": 0.7254040241241455,
+        "p95_gen_time": 2.032637119293213,
+        "avg_total_time": 13.6771865023507
+      },
+      "medium": {
+        "count": 23,
+        "avg_gen_time": 1.4335608067719832,
+        "p95_gen_time": 2.5906689167022705,
+        "avg_total_time": 14.979225241619607
+      },
+      "long": {
+        "count": 9,
+        "avg_gen_time": 1.7760885026719835,
+        "p95_gen_time": 2.852356195449829,
+        "avg_total_time": 17.87790955437554
+      }
+    }
+  }
+}
