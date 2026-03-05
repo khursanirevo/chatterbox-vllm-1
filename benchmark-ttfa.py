@@ -2,8 +2,9 @@
 """
 Poisson Traffic Simulation with Time To First Audio (TTFA) Measurement
 
-This example measures the critical "Time To First Audio" metric - the latency
-from request arrival until the first audio chunk is ready to play.
+This benchmark measures the critical "Time To First Audio" metric using
+token-level streaming for optimal TTFA. Audio chunks are yielded as soon
+as tokens are generated, rather than waiting for complete generation.
 """
 
 import asyncio
@@ -14,7 +15,7 @@ import torchaudio as ta
 from typing import List, Tuple, Dict
 import statistics
 
-from chatterbox_vllm import ChatterboxTTSAsync
+from chatterbox_vllm import ChatterboxTTSStreaming
 
 
 # Diverse text prompts with varying lengths
@@ -66,7 +67,7 @@ def generate_poisson_requests(
 
 
 async def measure_ttfa(
-    model: ChatterboxTTSAsync,
+    model: ChatterboxTTSStreaming,
     request_id: str,
     text: str,
     arrival_time: float,
@@ -89,35 +90,25 @@ async def measure_ttfa(
     char_count = len(text)
 
     try:
-        # Track time to first audio
+        # Track time to first audio with token-level streaming
         first_chunk_time = None
         chunk_count = 0
-        chunk_size = 12000  # 0.5 second chunks
-
-        # Generate audio
-        results = await model.generate(
-            prompts=[text],
-            temperature=0.8,
-            exaggeration=0.5,
-        )
 
         generation_start = time.time()
 
-        if results and results[0] is not None:
-            audio = results[0]
-            total_samples = audio.shape[1]
+        # Stream audio chunks as tokens are generated
+        async for chunk in model.stream_audio_tokens(
+            prompt=text,
+            temperature=0.8,
+            exaggeration=0.5,
+        ):
+            if first_chunk_time is None:
+                # First chunk received - record TTFA
+                first_chunk_time = time.time()
+                # TTFA = time from request arrival to first chunk
+                ttfa = first_chunk_time - request_start_time
 
-            # Simulate streaming - record when first chunk would be available
-            for i in range(0, total_samples, chunk_size):
-                chunk = audio[:, i:i+chunk_size]
-                chunk_count += 1
-
-                if first_chunk_time is None:
-                    # First chunk available now
-                    first_chunk_time = time.time()
-
-                    # TTFA = time from request arrival to first chunk
-                    ttfa = first_chunk_time - request_start_time
+            chunk_count += 1
 
         generation_end = time.time()
         total_time = generation_end - start_time
@@ -161,7 +152,7 @@ async def measure_ttfa(
 def print_ttfa_report(results: List[Dict], total_time: float, num_requests: int, avg_rate: float):
     """Print comprehensive TTFA report."""
     print("\n" + "="*90)
-    print("POISSON TRAFFIC SIMULATION REPORT - WITH TIME TO FIRST AUDIO (TTFA)")
+    print("TOKEN STREAMING TTFA BENCHMARK REPORT")
     print("="*90)
 
     print(f"\nSimulation Parameters:")
@@ -271,7 +262,7 @@ def print_ttfa_report(results: List[Dict], total_time: float, num_requests: int,
 async def main():
     """Run Poisson traffic simulation with TTFA measurement."""
     print("\n" + "="*90)
-    print("CHATTERBOX VLLM - POISSON TRAFFIC WITH TIME TO FIRST AUDIO")
+    print("CHATTERBOX VLLM - TOKEN STREAMING TTFA BENCHMARK")
     print("="*90)
 
     # Simulation parameters
@@ -297,8 +288,8 @@ async def main():
     print(f"  Time span: {requests[-1][0]:.2f} seconds")
 
     # Initialize model
-    print(f"\nInitializing ChatterboxTTSAsync with continuous batching...")
-    model = await ChatterboxTTSAsync.from_pretrained(
+    print(f"\nInitializing ChatterboxTTSStreaming with token-level streaming...")
+    model = await ChatterboxTTSStreaming.from_pretrained(
         max_batch_size=16,
         max_model_len=1000,
     )
@@ -349,15 +340,15 @@ async def main():
             print(f"  ❌ HIGH: Average TTFA {avg_ttfa:.2f}s - optimization recommended.")
 
         print(f"\nRecommendations:")
-        print(f"  1. For better TTFA:")
-        print(f"     - Reduce chunk size (current: {CHUNK_SIZE/24000:.2f}s)")
-        print(f"     - Enable token-level streaming (requires implementation)")
-        print(f"     - Use smaller max_model_len for faster processing")
+        print(f"  1. Current implementation:")
+        print(f"     - Token-level streaming ENABLED")
+        print(f"     - Audio chunks generated as tokens arrive")
+        print(f"     - Optimal TTFA for interactive applications")
 
-        print(f"\n  2. Current implementation:")
-        print(f"     - TTFA includes full token generation time")
-        print(f"     - First chunk available after T3+S3Gen complete")
-        print(f"     - For true streaming: implement token streaming from vLLM")
+        print(f"\n  2. For further optimization:")
+        print(f"     - Adjust min_tokens_for_audio (trade-off: quality vs latency)")
+        print(f"     - Reduce stream_chunk_samples for smaller chunks")
+        print(f"     - Enable CUDA MPS for batch workloads")
 
         print(f"\n  3. Production tuning:")
         print(f"     - Monitor P95/P99 TTFA for SLA compliance")
