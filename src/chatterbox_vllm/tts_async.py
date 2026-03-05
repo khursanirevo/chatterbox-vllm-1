@@ -112,8 +112,6 @@ class ChatterboxTTSAsync:
                         variant: str = "english",
                         s3gen_use_fp16: bool = False,
                         s3gen_compile_model: bool = False,
-                        s3gen_use_tensorrt: bool = False,
-                        s3gen_tensorrt_engine_path: Optional[str] = None,
                         enable_ttfa_tracking: bool = False,
                         **kwargs) -> 'ChatterboxTTSAsync':
         """
@@ -128,8 +126,6 @@ class ChatterboxTTSAsync:
             variant: Model variant ("english" or "multilingual")
             s3gen_use_fp16: Whether to use FP16 for S3Gen
             s3gen_compile_model: Whether to compile S3Gen with torch.compile() (30-40% speedup)
-            s3gen_use_tensorrt: Whether to use TensorRT for S3Gen (2-3x speedup, requires engine file)
-            s3gen_tensorrt_engine_path: Path to TensorRT engine file (required if s3gen_use_tensorrt=True)
             enable_ttfa_tracking: Enable TTFA profiling and metrics collection
             **kwargs: Additional arguments for AsyncEngineArgs
 
@@ -196,21 +192,9 @@ class ChatterboxTTSAsync:
         ve.load_state_dict(load_file(ckpt_dir / "ve.safetensors"))
         ve = ve.to(device=target_device).eval()
 
-        # Determine TensorRT engine path
-        trt_engine_path = None
-        if s3gen_use_tensorrt:
-            if s3gen_tensorrt_engine_path is None:
-                raise ValueError(
-                    "s3gen_use_tensorrt=True requires s3gen_tensorrt_engine_path to be set.\n"
-                    "Please build the TensorRT engine first:\n"
-                    "  python build_s3gen_tensorrt.py --export-onnx"
-                )
-            trt_engine_path = s3gen_tensorrt_engine_path
-
         s3gen = S3Gen(
             use_fp16=s3gen_use_fp16,
             compile_model=s3gen_compile_model,
-            tensorrt_engine_path=trt_engine_path,
         )
         s3gen.load_state_dict(load_file(ckpt_dir / "s3gen.safetensors"), strict=False)
         s3gen = s3gen.to(device=target_device).eval()
