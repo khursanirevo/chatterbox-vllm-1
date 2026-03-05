@@ -238,6 +238,15 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         self.pre_lookahead_len = pre_lookahead_len
         self.fp16 = use_fp16
 
+        # Convert affine layers to fp16 if use_fp16 is enabled
+        if self.fp16:
+            self.spk_embed_affine_layer = self.spk_embed_affine_layer.half()
+            self.encoder_proj = self.encoder_proj.half()
+            self.input_embedding = self.input_embedding.half()
+            # Also convert encoder and decoder submodules to fp16
+            self.encoder = self.encoder.half()
+            self.decoder = self.decoder.half()
+
     @torch.inference_mode()
     def inference(self,
                   token,
