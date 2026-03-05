@@ -1,0 +1,58 @@
+{
+  "short": {
+    "text": "Hello, how are you today?",
+    "latency": 1.332869291305542,
+    "audio_file": "quality_baseline_samples/n_timesteps_10_short.wav",
+    "sample_rate": 24000,
+    "duration_samples": 38400,
+    "duration_seconds": 1.6
+  },
+  "medium": {
+    "text": "The weather today is quite nice, with clear skies and mild temperatures expected throughout the day.",
+    "latency": 1.664640188217163,
+    "audio_file": "quality_baseline_samples/n_timesteps_10_medium.wav",
+    "sample_rate": 24000,
+    "duration_samples": 149760,
+    "duration_seconds": 6.24
+  },
+  "long": {
+    "text": "This is a significantly longer text passage designed to test the text to speech synthesis pipeline with more content to process through multiple stages including tokenization, language model inference, and audio decoding.",
+    "latency": 3.026223659515381,
+    "audio_file": "quality_baseline_samples/n_timesteps_10_long.wav",
+    "sample_rate": 24000,
+    "duration_samples": 312960,
+    "duration_seconds": 13.04
+  },
+  "punctuation": {
+    "text": "Hello! How are you? I'm doing great, thanks for asking. What about you?",
+    "latency": 1.216155767440796,
+    "audio_file": "quality_baseline_samples/n_timesteps_10_punctuation.wav",
+    "sample_rate": 24000,
+    "duration_samples": 97920,
+    "duration_seconds": 4.08
+  },
+  "numbers": {
+    "text": "The price is $19.99, and it will arrive in 3 to 5 business days.",
+    "latency": 1.3206050395965576,
+    "audio_file": "quality_baseline_samples/n_timesteps_10_numbers.wav",
+    "sample_rate": 24000,
+    "duration_samples": 109440,
+    "duration_seconds": 4.56
+  },
+  "emotional": {
+    "text": "I am so excited to share this wonderful news with everyone! This is absolutely amazing!",
+    "latency": 1.4456663131713867,
+    "audio_file": "quality_baseline_samples/n_timesteps_10_emotional.wav",
+    "sample_rate": 24000,
+    "duration_samples": 120000,
+    "duration_seconds": 5.0
+  },
+  "question": {
+    "text": "Really? That's quite surprising, isn't it?",
+    "latency": 0.8895387649536133,
+    "audio_file": "quality_baseline_samples/n_timesteps_10_question.wav",
+    "sample_rate": 24000,
+    "duration_samples": 57600,
+    "duration_seconds": 2.4
+  }
+}
