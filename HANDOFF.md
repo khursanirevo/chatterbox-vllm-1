@@ -21,6 +21,53 @@ Optimize vLLM generation parameters to achieve:
 
 ## Recent Work (2025-03-05)
 
+### ✅ Comprehensive Load Profiling (COMPLETED)
+
+**Commits:** `b8fa9cd`, `f948a0c`
+
+Created detailed profiling infrastructure to understand performance under load and identify bottlenecks.
+
+**Key Findings:**
+
+1. **Queue Time: 0.00% of Latency (0.06ms mean)**
+   - System is NOT bottlenecked by queuing
+   - vLLM continuous batching works efficiently
+   - Requests start processing almost immediately
+
+2. **Processing Time: 100% of Latency (6,440ms mean)**
+   - All time spent in T3 + S3Gen computation
+   - System is compute-bound, not queue-bound
+
+3. **S3Gen Dominates Under Load (95-97% of Processing Time)**
+   - Short texts: ~4.6s processing
+   - Medium texts: ~5.4s processing
+   - Long texts: ~10.1s processing
+
+4. **Throughput: 4.25 req/s (Target: 2 req/s)**
+   - **212% of target** - 2x headroom available
+   - 100% success rate (50/50 requests)
+
+**Files Created:**
+- `profile_detailed_components.py` - Detailed component profiler
+- `profile_poisson_load.py` - Poisson traffic load tester
+- `DETAILED_PROFILING_SUMMARY.md` - Component breakdown analysis
+- `POISSON_LOAD_ANALYSIS.md` - Load test analysis with queue breakdown
+- `poisson_load_profiling_results.json` - Raw timing data
+
+**Insight:** The user asked "S3Gen slow because of it only do one batch or because of other thing?"
+
+**Answer:** S3Gen is slow because:
+1. **Flow matching diffusion** - 5 sequential steps, each takes ~600ms for long texts
+2. **NOT batching** - S3Gen processes one request at a time (sequential, not batched like T3)
+3. **Model architecture** - ConditionalCFM solver is inherently sequential (Euler integration)
+
+The 5 flow matching steps CANNOT be batched because:
+- Each step depends on the previous step's output
+- Sequential nature of ODE/SDE solver
+- NOT a parallel operation
+
+---
+
 ### ✅ TensorRT Cleanup (COMPLETED)
 
 **Commit:** `47db1b4`
@@ -99,8 +146,14 @@ Created test suite with 100% success rate under concurrent load.
 ### 5. FP16 Optimization ✅
 Fixed dtype mismatch, achieving 1.09x speedup (short prompts), 1.02x overall.
 
-### 6. TensorRT Support ✅ (Code Complete)
-Implemented full TensorRT integration (engines not yet built).
+### 6. Load Profiling Analysis ✅
+Comprehensive profiling under Poisson traffic (2 req/s, 50 requests):
+- **Key Finding:** Queue time is 0.00% (negligible), processing time is 100%
+- **Insight:** S3Gen is slow because it processes requests sequentially (one at a time), NOT because of batching
+- **Root Cause:** 5 sequential flow matching steps that CANNOT be parallelized (each step depends on previous output)
+
+### 7. TensorRT Support ✅ (Code Complete, Later Removed)
+Implemented full TensorRT integration but removed due to Python 3.12 incompatibility.
 
 ---
 
@@ -209,7 +262,54 @@ results = await model.generate(
 
 ## Next Steps (Optional Improvements)
 
-### 1. TensorRT with Python 3.11/Docker (HIGH EFFORT, HIGH REWARD)
+### 0. Understanding S3Gen Performance (IMPORTANT CONTEXT)
+
+**User Question:** "S3Gen slow because of it only do one batch or because of other thing?"
+
+**Answer:** S3Gen is slow because:
+
+1. **Sequential Processing (NOT batching)**
+   - S3Gen processes ONE request at a time (unlike T3 which batches multiple requests)
+   - Each request waits for previous S3Gen to complete
+   - This is by design - flow matching requires sequential steps
+
+2. **Flow Matching Architecture (Cannot be batched)**
+   - 5 sequential steps (Euler integration of ODE/SDE)
+   - Each step depends on the previous step's output
+   - **Cannot parallelize** - it's inherently sequential
+   - Each step takes ~600ms for long texts = ~3 seconds total
+
+3. **Model Computation** (Dominates processing time)
+   - ConditionalCFM estimator: ~200-250ms per call
+   - 5 calls × 250ms = 1.25-1.5 seconds
+   - Plus encoder/decoder/vocoder overhead
+
+4. **Comparison to T3:**
+   - T3: Uses continuous batching (multiple requests processed together)
+   - S3Gen: Sequential (one at a time, by design)
+
+**Conclusion:** S3Gen is slow due to **sequential flow matching architecture**, NOT because of batching. The 5 diffusion steps CANNOT be parallelized.
+
+---
+
+### 1. Reduce CFG Rate (HIGH IMPACT, QUALITY TRADE-OFF)
+
+**Potential:** 2x speedup
+
+**Current:** `inference_cfg_rate=0.7` in CFM_PARAMS (see `flow_matching.py`)
+
+**Test:** Set to 0.0 or 0.2
+
+**Risk:** Mode collapse or quality degradation
+
+**Implementation:**
+- Edit `CFM_PARAMS` in `flow_matching.py`
+- Set `inference_cfg_rate` to 0.2 or 0.0
+- Test audio quality
+
+---
+
+### 2. TensorRT with Python 3.11/Docker (HIGH EFFORT, HIGH REWARD)
 
 **Challenge:** Current Python 3.12 is incompatible with TensorRT.
 
@@ -226,15 +326,9 @@ results = await model.generate(
 
 **Expected:** 2-3x S3Gen speedup → 30-45% TTFA improvement
 
-### 2. Reduce CFG Rate (HIGH IMPACT, QUALITY TRADE-OFF)
+**Note:** Will NOT change the sequential nature of S3Gen, but will make each step faster.
 
-**Potential:** 2x speedup
-
-**Current:** `inference_cfg_rate=0.7` in CFM_PARAMS (see `flow_matching.py`)
-
-**Test:** Set to 0.0 or 0.2
-
-**Risk:** Mode collapse or quality degradation
+---
 
 ### 3. T3 Optimization (MEDIUM IMPACT)
 
@@ -358,6 +452,8 @@ VLLM_WORKER_MULTIPROC_METHOD=spawn  # Multiprocessing method
 
 **Recent commits (as of 2025-03-05):**
 ```
+f948a0c Add comprehensive load profiling with queue analysis
+b8fa9cd Add detailed component profiling and summary
 47db1b4 Remove rejected TensorRT optimization attempts
 a8db5aa Fix FP16 dtype mismatch and enable production use
 0ddb8ae Benchmark combined S3Gen optimizations
@@ -415,3 +511,4 @@ a8db5aa Fix FP16 dtype mismatch and enable production use
 **Status:** ✅ PRODUCTION READY - All objectives achieved
 **Optimization Level:** 1.93x speedup achieved
 **Repository State:** Clean (rejected optimizations removed)
+**Profiling Complete:** Load test confirms queue time negligible (0.00%), S3Gen sequential processing is bottleneck
