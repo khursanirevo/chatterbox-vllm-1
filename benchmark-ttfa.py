@@ -27,11 +27,12 @@ This benchmark includes all optimizations applied to Chatterbox vLLM:
       - Half-precision floating point for S3Gen
       - Identical audio quality to FP32
 
-   ✅ CUDA MPS parallel S3Gen (3-5x throughput for batched workloads)
-      - Multiple worker processes share GPU
-      - Persistent worker pool (4 workers)
-      - Activates for batches ≥ 4 prompts
-      - Note: Individual Poisson arrivals don't benefit (architectural limitation)
+   ✅ CUDA MPS parallel S3Gen (3-5x throughput for concurrent workloads)
+      - 4 independent S3Gen model instances on single GPU
+      - Each worker processes requests independently
+      - As soon as T3 finishes for ANY request, an MPS worker can process it
+      - No waiting for batch completion - true parallelism!
+      - vLLM continuous batching feeds MPS workers efficiently
 
 3. LATENCY OPTIMIZATIONS
    ✅ Token-level streaming (19-78% TTFA improvement for long texts)
