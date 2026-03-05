@@ -9,5 +9,6 @@ This package provides both synchronous and asynchronous TTS implementations:
 
 from chatterbox_vllm.tts import ChatterboxTTS
 from chatterbox_vllm.tts_async import ChatterboxTTSAsync
+from chatterbox_vllm.tts_streaming import ChatterboxTTSStreaming
 
-__all__ = ["ChatterboxTTS", "ChatterboxTTSAsync"]
+__all__ = ["ChatterboxTTS", "ChatterboxTTSAsync", "ChatterboxTTSStreaming"]
