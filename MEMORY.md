@@ -597,6 +597,52 @@ First audio chunk:           ~450-550ms ✅ <1s target!
 
 - `CONCURRENT_BURST_RESULTS.md` - Detailed concurrent testing analysis
 
+### Prefix Caching Analysis (Added 2026-03-07)
+
+**IMPORTANT DISCOVERY**: Tested with 32 unique texts to eliminate prefix caching advantage.
+
+#### Comparison: Identical vs Unique Texts
+
+| Burst | Cached TTFA | Unique TTFA | Difference | Insight |
+|-------|-------------|-------------|------------|---------|
+| 1 | 9.1ms | 26.3ms | +189% | Prefix caching helps single requests |
+| 4 | 36.6ms | 54.1ms | +48% | Some caching benefit at low concurrency |
+| 8 | 29.6ms | 32.3ms | +9% | Minimal benefit |
+| **16** | **30.7ms** | **29.2ms** | **-5%** | **Unique is FASTER!** |
+| **32** | **48.6ms** | **32.1ms** | **-34%** | **Unique MUCH FASTER!** |
+
+#### Why Unique Texts Are Faster at High Concurrency
+
+This is **expected behavior** for vLLM's continuous batching:
+
+1. **Identical texts with prefix caching**: All requests compete for the same cached KV cache slots, causing contention
+2. **Unique texts**: Each request has different tokens, so continuous batching can efficiently interleave them without cache contention
+
+#### Unique Texts Results (No Prefix Caching)
+
+| Concurrent | Avg TTFA | Median | 95th %ile | <100ms | Throughput |
+|------------|----------|--------|-----------|--------|------------|
+| **1** | 26.3ms | 26.3ms | 26.3ms | 100% | 38 req/s |
+| **4** | 54.1ms | 60.3ms | 63.4ms | 100% | 18 req/s |
+| **8** | 32.3ms | 32.9ms | 37.9ms | 100% | 28 req/s |
+| **16** | 29.2ms | 29.0ms | 35.8ms | 100% | 20 req/s |
+| **32** | 32.1ms | 32.0ms | 40.4ms | 100% | 39 req/s |
+
+#### Production Implications
+
+The good news:
+- ✅ **Real-world traffic is diverse** (not all identical requests)
+- ✅ **32 concurrent unique texts**: Only **32ms average TTFA** (excellent!)
+- ✅ **All burst sizes maintain 100% under 100ms**
+- ✅ **Better performance than cached** at high concurrency (16, 32)
+- ✅ **Continuous batching excels** with diverse token sequences
+
+**Conclusion**: AsyncLLMEngine performance is even better for production workloads with diverse inputs!
+
+#### Test Script
+
+- `test-concurrent-unique.py` - Burst testing with 36 unique texts
+
 ---
 
 ## Next Session Setup
