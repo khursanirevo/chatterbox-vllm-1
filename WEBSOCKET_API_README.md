@@ -27,7 +27,25 @@ pip install fastapi uvicorn websockets scipy
 
 ## Quick Start
 
-### 1. Start the Server
+### Option 1: Web Frontend (Easiest)
+
+Start everything with one command:
+
+```bash
+chmod +x start-all.sh
+./start-all.sh
+```
+
+Then open your browser to: **http://localhost:8080**
+
+The frontend includes:
+- 📝 Text input with preset examples
+- ⚙️ Adjustable parameters (temperature, max tokens, chunk size)
+- 📊 Real-time metrics display
+- 🔊 Live audio playback
+- 📋 Progress tracking
+
+### Option 2: WebSocket Server Only
 
 ```bash
 # Using uv
@@ -39,7 +57,7 @@ CUDA_VISIBLE_DEVICES=0 python -m src.chatterbox_vllm.websocket_api
 
 The server will start on `http://0.0.0.0:8000`
 
-### 2. Test with Python Client
+### Option 3: Python Test Client
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 uv run python test-websocket-client.py
@@ -258,6 +276,91 @@ ws.onerror = (error) => {
 # Here's using websocat:
 echo '{"text":"Hello world"}' | websocat ws://localhost:8000/tts/websocket
 ```
+
+## Web Frontend
+
+A complete web-based UI is included for easy interaction with the TTS API.
+
+### Screenshot Preview
+
+The frontend features:
+- 🎨 **Modern UI** - Beautiful gradient design with responsive layout
+- 🔌 **One-click connect** - Easy WebSocket connection management
+- 📝 **Preset texts** - Quick test buttons for short, medium, and long texts
+- ⚙️ **Configurable parameters** - Adjust temperature, max tokens, chunk size
+- 📊 **Real-time metrics** - First token/chunk latency, total time, chunk count
+- 🔊 **Live playback** - Audio chunks play as they arrive
+- 📋 **Progress tracking** - Visual progress bar with status updates
+- 📜 **Optional logging** - Detailed logs for debugging
+
+### Starting the Frontend
+
+**Option 1: Start Everything (Recommended)**
+
+```bash
+chmod +x start-all.sh
+./start-all.sh
+```
+
+This starts both:
+- WebSocket API server on port 8000
+- Frontend HTTP server on port 8080
+
+**Option 2: Frontend Only**
+
+```bash
+chmod +x serve-frontend.sh
+./serve-frontend.sh
+# Or manually: python3 -m http.server 8080 --directory frontend
+```
+
+Then open your browser to: **http://localhost:8080**
+
+### Frontend Features
+
+1. **Connection Status** - Visual indicator showing WebSocket connection state
+2. **Text Input** - Large textarea with preset example texts
+3. **Settings Panel** - Adjust generation parameters
+4. **Generate Button** - Start speech generation (disabled when not connected)
+5. **Progress Bar** - Real-time progress during generation
+6. **Metrics Display** - Shows latency and timing information
+7. **Audio Playback** - Chunks play automatically as they arrive
+8. **Log Panel** - Optional detailed logging (toggle with checkbox)
+
+### Browser Compatibility
+
+Tested on:
+- ✅ Chrome/Edge 90+
+- ✅ Firefox 88+
+- ✅ Safari 14+
+- ✅ Opera 76+
+
+**Note:** Requires a modern browser with WebSocket and Web Audio API support.
+
+### Customizing the Frontend
+
+The frontend is a single HTML file (`frontend/index.html`) with embedded CSS and JavaScript. You can modify:
+
+- **Styling**: Edit the `<style>` section for custom colors/layout
+- **WebSocket URL**: Change `ws://localhost:8000` to your server
+- **Default settings**: Modify input field default values
+- **Audio playback**: Adjust chunk queuing behavior
+
+### Using the Frontend with Remote Server
+
+To connect to a remote WebSocket server:
+
+1. Open `frontend/index.html` in a text editor
+2. Find this line in the JavaScript:
+   ```javascript
+   const wsUrl = 'ws://localhost:8000/tts/websocket';
+   ```
+3. Change to your server URL:
+   ```javascript
+   const wsUrl = 'wss://your-server.com/tts/websocket';
+   ```
+
+**Note:** For HTTPS/WSS, ensure your server has valid SSL certificates.
 
 ## Performance
 
