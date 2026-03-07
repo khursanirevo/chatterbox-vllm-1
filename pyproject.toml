@@ -41,8 +41,7 @@ dev = ["build", "twine"]
 version = { file = ".latest-version.generated.txt" }
 
 [tool.setuptools.package-data]
-chatterbox_vllm = ["models/t3/*.json", "models/*/t3/*.json"]
-"chatterbox_vllm" = ["*.py"]
+chatterbox_vllm = ["models/t3/*.json", "models/*/t3/*.json", "*.py"]
 
 [build-system]
 requires = ["setuptools", "wheel"]
