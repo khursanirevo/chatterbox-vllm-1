@@ -184,36 +184,38 @@ class S3GenStreamPool:
         self.metrics.queue_depth = self.stream_queue.qsize()
 
         try:
-            # Step 2: Run inference in thread pool (non-blocking)
-            loop = asyncio.get_event_loop()
-
+            # Step 2: Run inference on CUDA stream using asyncio task
+            # CUDA streams can execute concurrently without Python threads
             def _inference_on_stream():
-                """Synchronous function to run in thread pool."""
-                with torch.cuda.stream(stream):
-                    # Build tokens with context
-                    tokens_to_process = self._build_token_context(
-                        token_chunk, context_tokens, context_window
-                    )
+                """Synchronous function to run on CUDA stream."""
+                # Build tokens with context
+                tokens_to_process = self._build_token_context(
+                    token_chunk, context_tokens, context_window
+                )
 
-                    # Run S3Gen inference (concurrent with other streams)
-                    result = self.s3gen.inference(
-                        speech_tokens=tokens_to_process,
-                        ref_dict=s3gen_ref,
-                        finalize=False,
-                        n_timesteps=diffusion_steps,
-                    )
+                # Set current CUDA stream
+                torch.cuda.set_stream(stream)
 
-                    # S3Gen.inference() returns (audio, sources) tuple
-                    # Extract just the audio tensor
-                    audio = result[0] if isinstance(result, tuple) else result
+                # Run S3Gen inference (concurrent with other streams)
+                result = self.s3gen.inference(
+                    speech_tokens=tokens_to_process,
+                    ref_dict=s3gen_ref,
+                    finalize=False,
+                    n_timesteps=diffusion_steps,
+                )
 
-                    return audio
+                # S3Gen.inference() returns (audio, sources) tuple
+                # Extract just the audio tensor
+                audio = result[0] if isinstance(result, tuple) else result
 
-            # Submit to thread pool
-            audio_chunk = await loop.run_in_executor(
-                None,  # Use default executor
-                _inference_on_stream,
-            )
+                # Synchronize the stream to ensure completion
+                stream.synchronize()
+
+                return audio
+
+            # Run in executor (thread pool) but ensure CUDA context is available
+            loop = asyncio.get_event_loop()
+            audio_chunk = await loop.run_in_executor(None, _inference_on_stream)
 
             return audio_chunk
 
