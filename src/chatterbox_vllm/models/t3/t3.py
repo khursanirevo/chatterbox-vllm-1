@@ -322,14 +322,51 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
         loaded_params.update('tfmr.' + i for i in llama_loaded_params)
 
         # Precompute text positional embeddings
-        text_position_ids = torch.arange(self.t3conf.max_text_tokens + 2, device=self.text_pos_emb.emb.weight.device)
-        self.precomputed_text_pos_emb = self.text_pos_emb.get_fixed_embedding(text_position_ids)[0]
+        # Ensure they're on the same device as the embedding layers
+        text_device = self.text_emb.weight.device
+        text_position_ids = torch.arange(self.t3conf.max_text_tokens + 2, device=text_device)
+        self.precomputed_text_pos_emb = self.text_pos_emb.get_fixed_embedding(text_position_ids)[0].to(text_device)
 
         # Precompute speech positional embeddings
-        speech_position_ids = torch.arange(self.t3conf.max_speech_tokens + 2 + 2, device=self.speech_pos_emb.emb.weight.device)
-        self.precomputed_speech_pos_emb = self.speech_pos_emb.get_fixed_embedding(speech_position_ids)[0]
+        # Ensure they're on the same device as the embedding layers
+        speech_device = self.speech_emb.weight.device
+        speech_position_ids = torch.arange(self.t3conf.max_speech_tokens + 2 + 2, device=speech_device)
+        self.precomputed_speech_pos_emb = self.speech_pos_emb.get_fixed_embedding(speech_position_ids)[0].to(speech_device)
 
         return loaded_params
+
+
+    def _validate_token_ids(self, input_ids: torch.Tensor, stage: str) -> None:
+        """Validate that token IDs are within valid range for embedding layers."""
+        import os
+        debug = os.environ.get("CHATTERBOX_DEBUG_TOKENS", "").lower() in ("1", "true", "yes")
+
+        if not debug:
+            return
+
+        # Check for negative IDs (will cause CUDA indexing errors after subtracting SPEECH_TOKEN_OFFSET)
+        if torch.any(input_ids < 0):
+            print(f"[CHATTERBOX DEBUG] {stage}: Negative token IDs found: {input_ids[input_ids < 0]}")
+
+        # Check for speech tokens exceeding vocabulary size
+        speech_mask = input_ids >= SPEECH_TOKEN_OFFSET
+        if torch.any(speech_mask):
+            speech_tokens = input_ids[speech_mask] - SPEECH_TOKEN_OFFSET
+            if torch.any(speech_tokens < 0) or torch.any(speech_tokens >= self.t3conf.speech_tokens_dict_size):
+                print(f"[CHATTERBOX DEBUG] {stage}: Speech tokens out of range:")
+                print(f"  Out-of-range tokens: {speech_tokens[(speech_tokens < 0) | (speech_tokens >= self.t3conf.speech_tokens_dict_size)]}")
+                print(f"  Valid range: 0 to {self.t3conf.speech_tokens_dict_size - 1}")
+
+        # Check device placement of precomputed embeddings
+        if hasattr(self, 'precomputed_text_pos_emb'):
+            text_device = self.text_emb.weight.device
+            if self.precomputed_text_pos_emb.device != text_device:
+                print(f"[CHATTERBOX WARNING] precomputed_text_pos_emb on {self.precomputed_text_pos_emb.device}, expected {text_device}")
+
+        if hasattr(self, 'precomputed_speech_pos_emb'):
+            speech_device = self.speech_emb.weight.device
+            if self.precomputed_speech_pos_emb.device != speech_device:
+                print(f"[CHATTERBOX WARNING] precomputed_speech_pos_emb on {self.precomputed_speech_pos_emb.device}, expected {speech_device}")
 
 
     def get_multimodal_embeddings(self, **kwargs: object) -> Optional[MultiModalEmbeddings]:
@@ -426,17 +463,21 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
         input_ids: torch.Tensor,
         multimodal_embeddings: Optional[MultiModalEmbeddings] = None,
     ) -> torch.Tensor:
+        # Validate token IDs for debugging (opt-in via CHATTERBOX_DEBUG_TOKENS=1)
+        self._validate_token_ids(input_ids, "get_input_embeddings")
+
         if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
             # There's no multimodal embeddings, so we're decoding.
             # Remember to undo the offset we applied to the speech tokens.
 
-            # if torch.min(input_ids) < SPEECH_TOKEN_OFFSET:
-            #     print("input_ids", input_ids)
-            #     print("torch.min(input_ids)", torch.min(input_ids))
-            #     print("SPEECH_TOKEN_OFFSET", SPEECH_TOKEN_OFFSET)
-            #     raise ValueError("input_ids is less than SPEECH_TOKEN_OFFSET")
-
-            embeds = self.speech_emb(input_ids - SPEECH_TOKEN_OFFSET)
+            # Clamp token IDs to valid range to prevent CUDA indexing errors
+            # This can happen when AsyncLLMEngine processes tokens in decode mode
+            adjusted_ids = torch.clamp(
+                input_ids - SPEECH_TOKEN_OFFSET,
+                0,
+                self.t3conf.speech_tokens_dict_size - 1
+            )
+            embeds = self.speech_emb(adjusted_ids)
 
             out = torch.cat([embeds, embeds], dim=1)
 
@@ -458,7 +499,13 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
                 if multimodal_embedding is None:
                     # There's no multimodal embeddings, so we're decoding.
                     # Remember to undo the offset we applied to the speech tokens.
-                    embeds = self.speech_emb(ids - SPEECH_TOKEN_OFFSET)
+                    # Clamp token IDs to valid range to prevent CUDA indexing errors
+                    adjusted_ids = torch.clamp(
+                        ids - SPEECH_TOKEN_OFFSET,
+                        0,
+                        self.t3conf.speech_tokens_dict_size - 1
+                    )
+                    embeds = self.speech_emb(adjusted_ids)
                     final_embeds = torch.cat([embeds, embeds], dim=1)
                     # assert len(final_embeds) == len(ids), "Number of output elements does not match number of input elements"
                     
@@ -484,7 +531,9 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
                     # The first 34 tokens are the cond portion. The remainder, except for the last token are the text
                     # portion. The last token is a placeholder for the start of speech token.
                     text_ids = ids[CONDITIONING_SIZE:-1]
-                    text_emb = self.text_emb(text_ids) + self.precomputed_text_pos_emb[0:len(text_ids)]
+                    # Clamp text token IDs to prevent CUDA indexing errors
+                    clamped_text_ids = torch.clamp(text_ids, 0, self.text_emb.num_embeddings - 1)
+                    text_emb = self.text_emb(clamped_text_ids) + self.precomputed_text_pos_emb[0:len(text_ids)]
 
                     start_of_speech_token = torch.tensor([self.t3conf.start_speech_token]).to(ids.device)
                     start_of_speech_emb = self.speech_emb(start_of_speech_token.unsqueeze(0))[0] + self.precomputed_speech_pos_emb[0:1]
@@ -508,7 +557,9 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
                     #  - We don't have any text tokens in this batch
                     #  - We only have part of the conditioning tokens in this batch
                     text_ids = ids[CONDITIONING_SIZE:]
-                    text_emb = self.text_emb(text_ids) + self.precomputed_text_pos_emb[0:len(text_ids)]
+                    # Clamp text token IDs to prevent CUDA indexing errors
+                    clamped_text_ids = torch.clamp(text_ids, 0, self.text_emb.num_embeddings - 1)
+                    text_emb = self.text_emb(clamped_text_ids) + self.precomputed_text_pos_emb[0:len(text_ids)]
 
                     # Generate version with both text and no-text embeddings for CFG
                     conditioning_emb = multimodal_embedding[0:min(CONDITIONING_SIZE, len(multimodal_embedding))]
@@ -535,7 +586,9 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
                         # We have the full text input, and it's from indices[0]+1 to the end of the input.
                         # (indices[0] is the end of the conditioning)
                         text_ids = ids[indices[0]+1:-1]
-                        text_emb = self.text_emb(text_ids) + self.precomputed_text_pos_emb[0:len(text_ids)]
+                        # Clamp text token IDs to prevent CUDA indexing errors
+                        clamped_text_ids = torch.clamp(text_ids, 0, self.text_emb.num_embeddings - 1)
+                        text_emb = self.text_emb(clamped_text_ids) + self.precomputed_text_pos_emb[0:len(text_ids)]
                         
                         start_of_speech_token = torch.tensor([self.t3conf.start_speech_token]).to(ids.device)
                         start_of_speech_emb = self.speech_emb(start_of_speech_token.unsqueeze(0))[0] + self.precomputed_speech_pos_emb[0:1]
@@ -559,7 +612,9 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
                         # that was injected via our hack above.
                         text_pos = torch.sum(multimodal_embedding[0:len(text_ids)], dim=1) - 1
 
-                        text_emb = self.text_emb(text_ids) + self.precomputed_text_pos_emb[text_pos.tolist()]
+                        # Clamp text token IDs to prevent CUDA indexing errors
+                        clamped_text_ids = torch.clamp(text_ids, 0, self.text_emb.num_embeddings - 1)
+                        text_emb = self.text_emb(clamped_text_ids) + self.precomputed_text_pos_emb[text_pos.tolist()]
 
                         start_of_speech_token = torch.tensor([self.t3conf.start_speech_token]).to(ids.device)
                         start_of_speech_emb = self.speech_emb(start_of_speech_token.unsqueeze(0))[0]  + self.precomputed_speech_pos_emb[0:1]

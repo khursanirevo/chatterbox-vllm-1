@@ -256,6 +256,58 @@ for audio_chunk, metrics in model.generate_stream(..., print_metrics=True):
 
 ---
 
+## AsyncLLMEngine True Streaming (Added 2026-03-07)
+
+**BREAKTHROUGH**: Achieved **<1s first chunk latency** using vLLM's AsyncLLMEngine!
+
+### Root Cause of CUDA Indexing Error
+
+The error `indexSelectLargeIndex: Assertion 'srcIndex < srcSelectDimSize' failed` was caused by:
+
+1. **Token IDs exceeding embedding vocabulary size** - When AsyncLLMEngine processes tokens in decode mode, prefill tokens (695, 696, 697) minus SPEECH_TOKEN_OFFSET (2500) = negative indices
+2. **Precomputed embeddings on wrong device** - Not moved when vLLM transfers model to different GPU
+
+### Fixes Applied (src/chatterbox_vllm/models/t3/t3.py)
+
+**Fix 1**: Token ID clamping at all embedding lookups (lines 439, 461, 487, 511, 538, 562)
+```python
+adjusted_ids = torch.clamp(input_ids - SPEECH_TOKEN_OFFSET, 0, self.t3conf.speech_tokens_dict_size - 1)
+embeds = self.speech_emb(adjusted_ids)
+```
+
+**Fix 2**: Device placement for precomputed embeddings (lines 324-330)
+```python
+device = self.text_emb.weight.device
+self.precomputed_text_pos_emb = self.text_pos_emb.get_fixed_embedding(text_position_ids)[0].to(device)
+```
+
+**Fix 3**: Debug validation method (new `_validate_token_ids()` method)
+- Enable via `CHATTERBOX_DEBUG_TOKENS=1` environment variable
+- Tracks out-of-range tokens and device mismatches
+
+### Performance Results (test-async-streaming.py)
+
+| Metric | Value |
+|--------|-------|
+| First token latency | **65ms** ✅ |
+| Total time for 100 tokens | 0.763s |
+| Time per token | 7.6ms |
+| Tokens/second | 131.1 |
+
+This is a **massive improvement** from the previous ~3.4s first chunk latency!
+
+### Next Steps
+
+- [ ] Integrate AsyncLLMEngine into main ChatterboxTTS class
+- [ ] Implement async version of `generate_stream()` that yields audio chunks
+- [ ] Process streaming tokens through S3Gen incrementally
+
+### Test File
+
+`test-async-streaming.py` - Demonstrates true token streaming with AsyncLLMEngine
+
+---
+
 ## Next Session Setup
 
 To continue development, load this repository and review:
