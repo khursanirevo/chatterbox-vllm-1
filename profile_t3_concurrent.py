@@ -41,8 +41,7 @@ class RequestTimeline:
 
     # Queue and batch tracking
     queue_position: int = -1
-    batch_size_at_first_token: int = -1
-    max_batch_size_observed: int = -1
+    estimated_batch_size: int = -1  # Estimated based on concurrent level (vLLM doesn't expose actual batch size)
 
     # Timing breakdown
     t3_queue_time: float = 0.0
@@ -67,12 +66,12 @@ class RequestTimeline:
 
     @property
     def token_generation_rate(self) -> float:
-        """Tokens per second during generation."""
-        if self.token_count < 2 or len(self.token_arrivals) < 2:
-            return 0.0
-        # We have token counts, not timestamps, so estimate from first token to completion
-        duration = self.chunk_ready_time - self.first_token_time
-        return self.token_count / duration if duration > 0 else 0.0
+        """Tokens per second during generation.
+
+        Note: Returns 0.0 because tokens arrive in chunks, not incrementally.
+        Cannot measure true token generation rate from chunked delivery.
+        """
+        return 0.0
 
 
 class GPUMonitor:
@@ -202,19 +201,12 @@ class T3Profiler:
                             timeline.s3gen_time = (
                                 timeline.first_chunk_time - timeline.chunk_ready_time
                             )
-
-                            # Get GPU metrics for this request
-                            avg_util, avg_mem = self.gpu_monitor.stop()
-                            timeline.gpu_utilization_percent = avg_util
-                            timeline.gpu_memory_used_mb = avg_mem
-
                             # Got first chunk, continue to collect batch info
                             # but don't break yet - wait to see more batches
 
-            # After generation completes, try to get batch info from engine
-            # This is approximate since vLLM doesn't expose per-request batch info
-            timeline.batch_size_at_first_token = concurrent_level  # Approximate
-            timeline.max_batch_size_observed = concurrent_level  # Approximate
+            # After generation completes, estimate batch size
+            # Note: vLLM doesn't expose actual batch size, so we estimate from concurrent level
+            timeline.estimated_batch_size = concurrent_level
 
         except Exception as e:
             print(f"    ❌ Request {request_id} failed: {e}")
@@ -244,7 +236,7 @@ class T3Profiler:
                 f"{tl.time_to_first_token:>7.1f} "
                 f"{tl.time_to_chunk_ready:>7.1f} "
                 f"{tl.time_to_first_audio:>9.1f} "
-                f"{tl.batch_size_at_first_token:<6} "
+                f"{tl.estimated_batch_size:<6} "
                 f"{tl.gpu_utilization_percent:>5.1f} "
                 f"{tl.gpu_memory_used_mb:>7.1f} "
             )
@@ -327,8 +319,11 @@ async def main():
         timelines = await asyncio.gather(*tasks)
         total_time = time.time() - start_time
 
-        # Stop GPU monitoring
-        gpu_monitor.stop()
+        # Stop GPU monitoring and assign metrics to all timelines
+        avg_util, avg_mem = gpu_monitor.stop()
+        for timeline in timelines:
+            timeline.gpu_utilization_percent = avg_util
+            timeline.gpu_memory_used_mb = avg_mem
 
         # Store results
         all_results[concurrent] = {

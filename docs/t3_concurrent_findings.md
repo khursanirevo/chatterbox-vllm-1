@@ -43,8 +43,8 @@ Test parameters:
 - Time to First Token: 645ms
 - Time to 25 Tokens: 645ms (same as TTFT)
 - Time to First Audio: 645ms
-- Batch Size at First Token: 1
-- Token Generation Rate: 0 tok/s (cannot measure from single chunk)
+- Estimated Batch Size: 1
+- Token Generation Rate: N/A (cannot measure from chunked delivery)
 - GPU Utilization: 48.9%
 - GPU Memory: 75,184 MB
 
@@ -53,8 +53,8 @@ Test parameters:
 - Time to First Token: 1,603ms, 1,676ms (avg: 1,640ms)
 - Time to 25 Tokens: 1,603ms, 1,676ms (avg: 1,640ms)
 - Time to First Audio: 1,603ms, 1,676ms (avg: 1,640ms)
-- Batch Size at First Token: 2
-- Token Generation Rate: 0 tok/s per request
+- Estimated Batch Size: 2
+- Token Generation Rate: N/A (cannot measure from chunked delivery)
 - GPU Utilization: 77.4%
 - GPU Memory: 75,894 MB
 
@@ -63,8 +63,8 @@ Test parameters:
 - Time to First Token: 2,526ms, 2,445ms, 2,520ms, 2,508ms (avg: 2,500ms)
 - Time to 25 Tokens: 2,526ms, 2,445ms, 2,520ms, 2,508ms (avg: 2,500ms)
 - Time to First Audio: 2,526ms, 2,445ms, 2,520ms, 2,508ms (avg: 2,500ms)
-- Batch Size at First Token: 4
-- Token Generation Rate: 0 tok/s per request
+- Estimated Batch Size: 4
+- Token Generation Rate: N/A (cannot measure from chunked delivery)
 - GPU Utilization: 82.5%
 - GPU Memory: 76,346 MB
 
@@ -73,8 +73,8 @@ Test parameters:
 - Time to First Token: 6,862ms - 7,117ms (avg: 6,964ms)
 - Time to 25 Tokens: 6,862ms - 7,117ms (avg: 6,964ms)
 - Time to First Audio: 6,862ms - 7,117ms (avg: 6,964ms)
-- Batch Size at First Token: 8
-- Token Generation Rate: 0 tok/s per request
+- Estimated Batch Size: 8
+- Token Generation Rate: N/A (cannot measure from chunked delivery)
 - GPU Utilization: 64.7%
 - GPU Memory: 77,068 MB
 
@@ -83,8 +83,8 @@ Test parameters:
 - Time to First Token: 6,897ms - 63,624ms (avg: 19,759ms)
 - Time to 25 Tokens: 6,897ms - 63,624ms (avg: 19,759ms)
 - Time to First Audio: 6,897ms - 63,624ms (avg: 19,759ms)
-- Batch Size at First Token: 16
-- Token Generation Rate: 0 tok/s per request
+- Estimated Batch Size: 16
+- Token Generation Rate: N/A (cannot measure from chunked delivery)
 - GPU Utilization: 69.9%
 - GPU Memory: 78,879 MB
 - Note: 4 requests (positions 12-15) showed extreme outliers (48-64 seconds)
@@ -106,10 +106,9 @@ Test parameters:
    - At each concurrency level (except 16), all requests finish at approximately the same time
    - Time differences between requests in same batch are minimal (<5% variance)
 
-4. **Batch Size Approximation**
-   - Batch size at first token equals concurrent level
-   - Max batch size observed equals concurrent level
-   - Note: vLLM doesn't expose per-request batch info, so these are approximations
+4. **Estimated Batch Size**
+   - Estimated batch size equals concurrent level
+   - Note: vLLM doesn't expose per-request batch info, so concurrent level is used as estimate
 
 5. **Queue Position Impact**
    - Requests with higher queue positions show slightly longer TTFT
@@ -117,8 +116,8 @@ Test parameters:
    - At 16 concurrent, 4 requests showed extreme outliers (48-64 seconds)
 
 6. **Token Generation Rate**
-   - Cannot measure accurately because all tokens arrive in a single chunk
-   - Current instrumentation shows 0 tok/s due to chunked delivery
+   - Cannot measure because tokens arrive in chunks, not incrementally
+   - Returns 0.0 tok/s as tokens are delivered in batches
 
 7. **GPU Utilization Patterns**
    - 1 concurrent: 48.9% (underutilized)
