@@ -46,12 +46,21 @@ async def main():
             "This is the third test.",
         ]
 
+        # Helper to consume generator and return chunks
+        async def consume_generator(gen):
+            chunks = []
+            async for chunk, metrics in gen:
+                chunks.append(chunk)
+            return chunks
+
         start = asyncio.get_event_loop().time()
-        tasks = [model.generate_stream(t, print_metrics=False) for t in texts]
+        # Create coroutines that consume the async generators
+        tasks = [consume_generator(model.generate_stream(t, print_metrics=False)) for t in texts]
         results = await asyncio.gather(*tasks)
         elapsed = asyncio.get_event_loop().time() - start
 
         print(f"   Completed 3 requests in {elapsed:.2f}s ✅")
+        print(f"   Generated {sum(len(r) for r in results)} total chunks ✅")
 
         # Print metrics
         print(f"\n📊 Stream Pool Metrics:")

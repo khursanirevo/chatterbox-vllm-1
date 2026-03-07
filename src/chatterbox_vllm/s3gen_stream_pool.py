@@ -196,12 +196,16 @@ class S3GenStreamPool:
                     )
 
                     # Run S3Gen inference (concurrent with other streams)
-                    audio = self.s3gen.inference(
+                    result = self.s3gen.inference(
                         speech_tokens=tokens_to_process,
                         ref_dict=s3gen_ref,
                         finalize=False,
                         n_timesteps=diffusion_steps,
                     )
+
+                    # S3Gen.inference() returns (audio, sources) tuple
+                    # Extract just the audio tensor
+                    audio = result[0] if isinstance(result, tuple) else result
 
                     return audio
 
