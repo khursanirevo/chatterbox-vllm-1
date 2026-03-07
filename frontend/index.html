@@ -454,14 +454,22 @@
                 };
 
                 ws.onerror = (error) => {
-                    log('WebSocket error: ' + error, 'error');
+                    console.error('WebSocket error:', error);
+                    const errorMsg = error.type || 'Unknown error';
+                    log('WebSocket error: ' + errorMsg, 'error');
+
+                    // Log additional details
+                    if (ws.readyState === WebSocket.CLOSED) {
+                        log('Connection closed - code: ' + (ws.closeCode || 'unknown'), 'error');
+                    }
                 };
 
-                ws.onclose = () => {
+                ws.onclose = (event) => {
+                    console.log('WebSocket closed:', event);
                     updateStatus('disconnected', 'Disconnected');
                     document.getElementById('connectBtn').textContent = 'Connect';
                     document.getElementById('generateBtn').disabled = true;
-                    log('Disconnected from server', 'info');
+                    log(`Disconnected from server (code: ${event.code}, reason: "${event.reason || 'none'}")`, 'info');
                 };
             } catch (error) {
                 log('Connection error: ' + error.message, 'error');

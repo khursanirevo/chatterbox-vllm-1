@@ -481,7 +481,12 @@ async def tts_websocket(
         await websocket.close(code=1008, reason="Invalid API key")
         return
 
+    # Log connection attempt
+    logger.info(f"WebSocket connection attempt from: {websocket.client}")
+
     await websocket.accept()
+
+    logger.info(f"WebSocket connection accepted: {websocket.client}")
 
     # Get or create engine
     try:
@@ -496,7 +501,7 @@ async def tts_websocket(
         await websocket.close()
         return
 
-    logger.info(f"WebSocket connection established: {websocket.client}")
+    logger.info(f"WebSocket session ready: {websocket.client}")
 
     try:
         while True:
