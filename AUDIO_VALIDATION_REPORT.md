@@ -15,10 +15,10 @@ Three audio files were successfully generated using the Chatterbox vLLM TTS syst
 
 ### Audio Properties
 - **Format**: WAV (RIFF, Little-Endian)
-- **Sample Rate**: 16000 Hz
+- **Sample Rate**: 24000 Hz ✅ (S3GEN_SR)
 - **Channels**: 1 (Mono)
 - **Precision**: 16-bit PCM
-- **Bit Rate**: 256 kbps
+- **Bit Rate**: 384 kbps
 
 ## Performance Summary
 
