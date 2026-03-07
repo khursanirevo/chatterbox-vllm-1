@@ -41,13 +41,16 @@ import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import AsyncGenerator, Optional, Dict, Any, List
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 import torch
 import torch.nn.functional as F
 import numpy as np
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Request
 from fastapi.websockets import WebSocketState
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from vllm import AsyncLLMEngine, SamplingParams, AsyncEngineArgs
 
 from chatterbox_vllm.models.t3 import T3VllmModel
@@ -63,6 +66,40 @@ logger = logging.getLogger(__name__)
 
 # Set GPU visibility
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+
+class WebSocketCORSMiddleware(BaseHTTPMiddleware):
+    """
+    Custom middleware to handle CORS for WebSocket connections.
+
+    FastAPI's built-in CORS middleware doesn't handle WebSocket upgrade requests
+    properly. This middleware intercepts WebSocket upgrade requests and adds
+    the necessary CORS headers.
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        # Handle WebSocket upgrade requests with CORS
+        if request.url.path == "/tts/websocket" and request.method == "GET":
+            # Check if it's a WebSocket upgrade request
+            upgrade_header = request.headers.get("upgrade", "").lower()
+            if upgrade_header == "websocket":
+                # For WebSocket, we need to let the request through
+                # The CORS headers will be added by the FastAPI CORS middleware
+                # for the initial handshake
+                return await call_next(request)
+
+        # For all other requests, just pass through
+        response = await call_next(request)
+
+        # Add CORS headers to response
+        origin = request.headers.get("origin")
+        if origin:
+            response.headers["Access-Control-Allow-Origin"] = "*"
+            response.headers["Access-Control-Allow-Credentials"] = "true"
+            response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS, WebSocket"
+            response.headers["Access-Control-Allow-Headers"] = "*"
+
+        return response
 
 
 @dataclass
@@ -414,7 +451,10 @@ async def get_engine() -> AsyncLLMEngine:
 # FastAPI app
 app = FastAPI(title="Chatterbox vLLM Streaming TTS API")
 
-# Add CORS middleware
+# Add custom WebSocket CORS middleware first (before regular CORS)
+app.add_middleware(WebSocketCORSMiddleware)
+
+# Add regular CORS middleware for HTTP endpoints
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # Allow all origins for development
