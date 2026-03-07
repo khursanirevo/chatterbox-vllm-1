@@ -769,6 +769,7 @@ dependencies = [
     { name = "transformers" },
     { name = "uvicorn", extra = ["standard"] },
     { name = "vllm" },
+    { name = "websockets" },
 ]
 
 [package.optional-dependencies]
@@ -801,6 +802,7 @@ requires-dist = [
     { name = "uvicorn", extras = ["standard"] },
     { name = "vllm" },
     { name = "vllm", specifier = "==0.10.0" },
+    { name = "websockets" },
 ]
 provides-extras = ["dev"]
 

@@ -31,6 +31,7 @@ dependencies = [
     "pykakasi",
     "fastapi",
     "uvicorn[standard]",
+    "websockets",
 ]
 
 [project.optional-dependencies]
