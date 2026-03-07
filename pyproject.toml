@@ -29,6 +29,9 @@ dependencies = [
     "gradio",
     "spacy-pkuseg",
     "pykakasi",
+    "fastapi",
+    "uvicorn[standard]",
+    "websockets",
 ]
 
 [project.optional-dependencies]
@@ -39,6 +42,7 @@ version = { file = ".latest-version.generated.txt" }
 
 [tool.setuptools.package-data]
 chatterbox_vllm = ["models/t3/*.json", "models/*/t3/*.json"]
+"chatterbox_vllm" = ["*.py"]
 
 [build-system]
 requires = ["setuptools", "wheel"]
