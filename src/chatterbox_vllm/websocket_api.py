@@ -47,6 +47,7 @@ import torch.nn.functional as F
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.websockets import WebSocketState
+from fastapi.middleware.cors import CORSMiddleware
 from vllm import AsyncLLMEngine, SamplingParams, AsyncEngineArgs
 
 from chatterbox_vllm.models.t3 import T3VllmModel
@@ -412,6 +413,15 @@ async def get_engine() -> AsyncLLMEngine:
 
 # FastAPI app
 app = FastAPI(title="Chatterbox vLLM Streaming TTS API")
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow all origins for development
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/health")
