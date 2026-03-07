@@ -227,6 +227,35 @@ Potential improvements identified:
 
 ---
 
+## Profiling Feature (Added 2026-03-07)
+
+Added detailed profiling to `StreamingMetrics` to track timing breakdown:
+
+### New Metrics Fields
+- `text_tokenization_time`: Time to tokenize input text
+- `t3_token_generation_time`: Time for vLLM to generate speech tokens
+- `s3gen_first_chunk_time`: Time to process first audio chunk
+- `first_s3gen_inference_time`: Actual S3Gen inference time for first chunk
+- `last_chunk_time`: Time for most recent chunk
+- `avg_chunk_time`: Average time per chunk
+
+### Key Findings
+- **T3 generation** = 75% of first chunk latency (main bottleneck)
+- **S3Gen streaming** = 72% of total generation time
+- First chunk latency: ~3.4s (2.6s T3 + 0.7s S3Gen)
+- Average chunk time: ~430ms
+
+### Usage
+```python
+for audio_chunk, metrics in model.generate_stream(..., print_metrics=True):
+    print(f"T3 time: {metrics.t3_token_generation_time:.2f}s")
+    print(f"First chunk: {metrics.s3gen_first_chunk_time*1000:.1f}ms")
+```
+
+**Test script**: `test-profiling.py`
+
+---
+
 ## Next Session Setup
 
 To continue development, load this repository and review:

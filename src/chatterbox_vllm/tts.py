@@ -34,6 +34,17 @@ class StreamingMetrics:
     total_audio_duration: float = 0.0
     chunk_count: int = 0
 
+    # Detailed profiling (all in seconds)
+    text_tokenization_time: float = 0.0
+    t3_token_generation_time: float = 0.0
+    t3_first_token_time: float = 0.0  # Time to first speech token
+    s3gen_first_chunk_time: float = 0.0  # Time for first S3Gen chunk
+    first_s3gen_inference_time: float = 0.0  # Actual inference time for first chunk
+
+    # Per-chunk timing (updated for each chunk)
+    last_chunk_time: float = 0.0
+    avg_chunk_time: float = 0.0
+
 
 @dataclass
 class Conditionals:
@@ -518,6 +529,10 @@ class ChatterboxTTS:
         with torch.inference_mode():
             # === Stage 1: Generate all speech tokens using vLLM ===
             t3_start = time.time()
+            text_tokenization_start = time.time()
+            # Text already normalized above
+            metrics.text_tokenization_time = time.time() - text_tokenization_start
+
             batch_results = self.t3.generate(
                 [{
                     "prompt": text_normalized,
@@ -533,6 +548,7 @@ class ChatterboxTTS:
                 )
             )
             t3_gen_time = time.time() - t3_start
+            metrics.t3_token_generation_time = t3_gen_time
             if print_metrics:
                 print(f"[T3] Speech token generation: {t3_gen_time:.2f}s")
 
@@ -554,12 +570,16 @@ class ChatterboxTTS:
 
             # === Stage 2: Stream tokens through S3Gen ===
             all_tokens_processed = torch.tensor([], device="cuda", dtype=torch.long)
+            chunk_times = []
 
             for i in range(0, len(speech_tokens), chunk_size):
+                chunk_start = time.time()
+
                 # Get chunk
                 chunk = speech_tokens[i:i + chunk_size].unsqueeze(0)
 
-                # Process with S3Gen
+                # Process with S3Gen (time this)
+                s3gen_start = time.time()
                 audio_chunk = self._process_token_chunk(
                     token_chunk=chunk,
                     all_tokens_so_far=all_tokens_processed,
@@ -567,14 +587,26 @@ class ChatterboxTTS:
                     context_window=context_window,
                     fade_duration=fade_duration,
                 )
+                s3gen_time = time.time() - s3gen_start
 
                 # Update metrics
                 if metrics.chunk_count == 0:
                     metrics.latency_to_first_chunk = time.time() - start_time
+                    metrics.s3gen_first_chunk_time = time.time() - chunk_start
+                    metrics.first_s3gen_inference_time = s3gen_time
                     if print_metrics:
-                        print(f"Latency to first chunk: {metrics.latency_to_first_chunk:.3f}s")
+                        print(f"\n[PROFILE] First Audio Chunk Breakdown:")
+                        print(f"  - Text tokenization: {metrics.text_tokenization_time*1000:.2f}ms")
+                        print(f"  - T3 token generation: {metrics.t3_token_generation_time:.2f}s")
+                        print(f"  - First S3Gen chunk: {metrics.s3gen_first_chunk_time*1000:.2f}ms")
+                        print(f"    - S3Gen inference: {metrics.first_s3gen_inference_time*1000:.2f}ms")
+                        print(f"  - Total latency to first chunk: {metrics.latency_to_first_chunk:.3f}s")
 
                 metrics.chunk_count += 1
+                chunk_time = time.time() - chunk_start
+                chunk_times.append(chunk_time)
+                metrics.last_chunk_time = chunk_time
+                metrics.avg_chunk_time = sum(chunk_times) / len(chunk_times)
 
                 # Yield if we got audio
                 if audio_chunk is not None:
@@ -590,10 +622,22 @@ class ChatterboxTTS:
                 metrics.rtf = metrics.total_generation_time / metrics.total_audio_duration
 
             if print_metrics:
-                print(f"[S3Gen] Streaming complete: {metrics.chunk_count} chunks")
+                print(f"\n[S3Gen] Streaming complete: {metrics.chunk_count} chunks")
                 print(f"Total time: {metrics.total_generation_time:.2f}s, "
                       f"Audio: {metrics.total_audio_duration:.2f}s, "
                       f"RTF: {metrics.rtf:.3f}")
+                print(f"\n[PROFILE] Timing Breakdown:")
+                print(f"  - Text tokenization:      {metrics.text_tokenization_time*1000:.2f}ms")
+                print(f"  - T3 token generation:     {metrics.t3_token_generation_time:.2f}s ({metrics.t3_token_generation_time/metrics.total_generation_time*100:.1f}% of total)")
+                print(f"  - S3Gen streaming:         {metrics.total_generation_time - metrics.t3_token_generation_time:.2f}s ({(metrics.total_generation_time - metrics.t3_token_generation_time)/metrics.total_generation_time*100:.1f}% of total)")
+                print(f"  - First S3Gen chunk:       {metrics.s3gen_first_chunk_time*1000:.2f}ms")
+                print(f"    - S3Gen inference:       {metrics.first_s3gen_inference_time*1000:.2f}ms")
+                print(f"\n[PROFILE] Chunk Statistics:")
+                print(f"  - Total chunks:            {metrics.chunk_count}")
+                print(f"  - Avg time per chunk:      {metrics.avg_chunk_time*1000:.2f}ms")
+                print(f"  - Last chunk time:         {metrics.last_chunk_time*1000:.2f}ms")
+                if metrics.chunk_count > 1:
+                    print(f"  - Estimated remaining:     {metrics.avg_chunk_time * (len(speech_tokens) // chunk_size - metrics.chunk_count):.2f}s")
 
     def shutdown(self):
         del self.t3
