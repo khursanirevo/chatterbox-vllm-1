@@ -655,8 +655,11 @@ To continue development, load this repository and review:
 
 **Quick tests**:
 ```bash
+# Simple streaming (recommended for basic usage)
+CUDA_VISIBLE_DEVICES=0 uv run python simple_stream.py
+
 # Sync streaming (current production)
-CUDA_VISIBLE_DEVICES=0 uv run python example-tts-stream.py
+CUDA_VISIBLE_DEVICES=0 uv run python test_demo.py "Hello world"
 
 # Async token streaming (NEW - <1s latency)
 CUDA_VISIBLE_DEVICES=0 uv run python test-async-streaming.py
@@ -665,10 +668,14 @@ CUDA_VISIBLE_DEVICES=0 uv run python test-async-streaming.py
 CUDA_VISIBLE_DEVICES=0 uv run python test-async-streaming-complete.py
 
 # Profiling test
-CUDA_VISIBLE_DEVICES=0 uv run python test-profiling.py
+CUDA_VISIBLE_DEVICES=0 uv run python test_profiling.py simple
 ```
 
 **Key files to understand**:
+- `simple_stream.py` - Simple streaming script (recommended starting point)
+  - Warmup for steady-state performance
+  - Organized output with timestamps
+  - Individual chunk saving
 - `src/chatterbox_vllm/tts.py` - Sync streaming TTS implementation
   - Lines 29-47: `StreamingMetrics` dataclass
   - Lines 250-330: `_process_token_chunk()` method
@@ -870,4 +877,143 @@ Total: ~350ms regardless of text length! 🚀
 2. **Current sync implementation works** for texts ≤11 words
 3. **AsyncLLMEngine is required** for longer content or consistent <1s latency
 4. **S3Gen overhead is minimal** after warmup (~250-300ms)
+
+---
+
+## Session: 2026-03-07 - Simple Streaming Script
+
+### New Script: `simple_stream.py`
+
+**Objective**: Provide a minimal, easy-to-use script for sync streaming TTS generation.
+
+### Features
+
+- **Warmup included** - Runs "Warmup." generation first to achieve steady-state performance
+- **Organized output** - Creates timestamped folders with all outputs
+- **Reduced diffusion steps** - Uses 5 steps instead of 10 for faster generation (~2x speedup)
+- **Individual chunks saved** - Each chunk saved separately for analysis
+
+### Output Structure
+
+```
+output/
+└── YYYYMMDD_HHMMSS/          # timestamp folder
+    ├── input.txt             # original text input
+    ├── full_audio.wav        # combined complete audio
+    └── chunks/               # individual audio chunks
+        ├── chunk_001.wav
+        ├── chunk_002.wav
+        └── ...
+```
+
+### Usage
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run python simple_stream.py
+```
+
+### Script Configuration
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| `max_model_len` | 2000 | Maximum model length |
+| `gpu_memory_utilization` | 0.90 | GPU memory utilization |
+| `diffusion_steps` | 5 | S3Gen diffusion steps (faster) |
+| `chunk_size` | 25 | Tokens per chunk |
+| `context_window` | 50 | Context tokens for continuity |
+
+### Code Structure
+
+```python
+# 1. Setup output folder with timestamp
+output_dir = Path(f"output/{timestamp}")
+chunks_dir = output_dir / "chunks"
+
+# 2. Save text input
+(output_dir / "input.txt").write_text(text)
+
+# 3. Warmup (important for steady-state)
+for _ in model.generate_stream(text="Warmup.", print_metrics=False):
+    pass
+
+# 4. Stream and save chunks
+for audio_chunk, _ in model.generate_stream(...):
+    chunk_path = chunks_dir / f"chunk_{len(audio_chunks):03d}.wav"
+    ta.save(chunk_path, audio_chunk, model.sr)
+
+# 5. Save full audio
+full_path = output_dir / "full_audio.wav"
+ta.save(full_path, full_audio, model.sr)
+```
+
+### Performance Impact
+
+- **Warmup**: Reduces first chunk latency by ~638ms (44% faster)
+- **5 diffusion steps**: ~2x faster S3Gen generation with acceptable quality
+
+---
+
+## Session: 2025-03-07 - WebSocket TTS API
+
+### New WebSocket API
+
+**Objective**: Real-time streaming TTS via WebSocket protocol.
+
+### Features
+
+- **WebSocket endpoint**: `/ws/tts`
+- **Client sends**: Plain text string only
+- **Server streams**: Binary PCM audio chunks (float32, 24000 Hz, mono)
+- **Statistics**: JSON with first_chunk_ms, duration_s, rtf, chunks
+- **Uses AsyncChatterboxTTS**: <1s first chunk latency
+- **Hardcoded params**: chunk_size=25, diffusion_steps=5, etc.
+
+### Files
+
+- `src/chatterbox_vllm/websocket_api.py` - WebSocket server implementation
+- `test_websocket_client.py` - Test client script
+
+### Usage
+
+**Start server:**
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run python src/chatterbox_vllm/websocket_api.py
+```
+
+**Client protocol:**
+```python
+import websockets
+import json
+import numpy as np
+
+async with websockets.connect("ws://localhost:8000/ws/tts") as ws:
+    # Send text
+    await ws.send("Hello world")
+
+    # Receive binary PCM chunks
+    audio_chunks = []
+    while True:
+        message = await ws.recv()
+        if isinstance(message, bytes):
+            audio = np.frombuffer(message, dtype=np.float32)
+            audio_chunks.append(audio)
+        else:
+            data = json.loads(message)
+            if data.get("type") == "complete":
+                print(f"Stats: {data}")
+                break
+```
+
+### Output Statistics
+
+```json
+{
+  "type": "complete",
+  "first_chunk_ms": 767,
+  "duration_s": 4.5,
+  "rtf": 0.65,
+  "chunks": 20,
+  "total_time_s": 2.9
+}
+```
 
