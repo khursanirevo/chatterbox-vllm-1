@@ -165,7 +165,7 @@ class S3GenStreamPool:
             context_tokens: Optional context tokens for continuity
             s3gen_ref: S3Gen reference dictionary
             context_window: Context tokens to include for continuity
-            fade_duration: Fade-in duration in seconds
+            fade_duration: Fade-in duration in seconds (not yet implemented)
             diffusion_steps: S3Gen diffusion steps
 
         Returns:
@@ -213,12 +213,26 @@ class S3GenStreamPool:
 
             return audio_chunk
 
+        except RuntimeError as e:
+            # CUDA errors (OOM, kernel errors)
+            if "out of memory" in str(e).lower():
+                logger.warning(f"CUDA OOM on stream, request failed: {e}")
+                return None
+            else:
+                logger.error(f"CUDA runtime error: {e}")
+                raise
+
+        except ValueError as e:
+            # Invalid input
+            logger.warning(f"Invalid input to S3Gen: {e}")
+            return None
+
         finally:
             # Step 3: Always return stream to pool (even on error)
             self.metrics.active_streams -= 1
             await self.stream_queue.put(stream)
 
-            # Update metrics
+            # Update metrics (increment before calculating average)
             self.metrics.total_requests += 1
             if self.metrics.total_requests > 0:
                 self.metrics.avg_queue_wait_ms = (
