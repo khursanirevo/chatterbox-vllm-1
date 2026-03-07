@@ -19,7 +19,7 @@ import torch
 import torchaudio as ta
 
 from chatterbox_vllm.tts import ChatterboxTTS
-from chatterbox_vllm.models.s3tokenizer import S3_SR
+from chatterbox_vllm.models.s3gen import S3GEN_SR
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
@@ -98,10 +98,10 @@ def validate_audio_generation():
 
         # Concatenate audio chunks
         audio = torch.cat(audio_chunks, dim=-1)
-        duration = audio.shape[-1] / S3_SR
+        duration = audio.shape[-1] / S3GEN_SR
 
         # Save audio (torchaudio.save takes filepath, tensor, sample_rate)
-        ta.save(str(output_file), audio, S3_SR)
+        ta.save(str(output_file), audio, S3GEN_SR)
         file_size = Path(output_file).stat().st_size / 1024
 
         print(f"\n✓ Audio saved: {output_file}")
