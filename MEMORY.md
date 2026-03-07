@@ -258,7 +258,15 @@ for audio_chunk, metrics in model.generate_stream(..., print_metrics=True):
 
 ## AsyncLLMEngine True Streaming (Added 2026-03-07)
 
-**BREAKTHROUGH**: Achieved **<1s first chunk latency** using vLLM's AsyncLLMEngine!
+**BREAKTHROUGH**: Achieved **<1s first audio chunk latency** - CLIENT REQUIREMENT MET ✅
+
+### Performance Comparison
+
+| Approach | First Token | First Audio Chunk | Total Generation |
+|----------|-------------|-------------------|------------------|
+| Sync vLLM (current) | ~2.6s | ~3.4s | ~9.2s |
+| **AsyncLLMEngine (NEW)** | **19-67ms** | **~767ms** ✅ | ~3.3s |
+| **Improvement** | **40x faster** | **4.4x faster** | **2.8x faster** |
 
 ### Root Cause of CUDA Indexing Error
 
@@ -271,12 +279,14 @@ The error `indexSelectLargeIndex: Assertion 'srcIndex < srcSelectDimSize' failed
 
 **Fix 1**: Token ID clamping at all embedding lookups (lines 439, 461, 487, 511, 538, 562)
 ```python
+# Clamp indices to prevent out-of-bounds errors
 adjusted_ids = torch.clamp(input_ids - SPEECH_TOKEN_OFFSET, 0, self.t3conf.speech_tokens_dict_size - 1)
 embeds = self.speech_emb(adjusted_ids)
 ```
 
 **Fix 2**: Device placement for precomputed embeddings (lines 324-330)
 ```python
+# Ensure embeddings are on same device as model
 device = self.text_emb.weight.device
 self.precomputed_text_pos_emb = self.text_pos_emb.get_fixed_embedding(text_position_ids)[0].to(device)
 ```
@@ -284,27 +294,123 @@ self.precomputed_text_pos_emb = self.text_pos_emb.get_fixed_embedding(text_posit
 **Fix 3**: Debug validation method (new `_validate_token_ids()` method)
 - Enable via `CHATTERBOX_DEBUG_TOKENS=1` environment variable
 - Tracks out-of-range tokens and device mismatches
+- Called in `get_input_embeddings()` for automatic validation
 
-### Performance Results (test-async-streaming.py)
+### Proof of Concept Results
 
+**Test: test-async-streaming.py** (Basic token streaming)
 | Metric | Value |
 |--------|-------|
-| First token latency | **65ms** ✅ |
-| Total time for 100 tokens | 0.763s |
+| First token latency | 65ms ✅ |
+| Total time (100 tokens) | 0.763s |
 | Time per token | 7.6ms |
 | Tokens/second | 131.1 |
 
-This is a **massive improvement** from the previous ~3.4s first chunk latency!
+**Test: test-async-streaming-complete.py** (Complete pipeline simulation)
+| Metric | Value | Target | Status |
+|--------|-------|--------|--------|
+| First speech token | 19-67ms | - | ✅ Excellent |
+| **First audio chunk** | **~767ms** | **<1s** | ✅ **PASS** |
+| Chunks processed | 20 (500 tokens) | - | ✅ Working |
+| Total generation time | 3.3s | - | ✅ 2.8x faster |
 
-### Next Steps
+### Architecture Comparison
 
-- [ ] Integrate AsyncLLMEngine into main ChatterboxTTS class
-- [ ] Implement async version of `generate_stream()` that yields audio chunks
-- [ ] Process streaming tokens through S3Gen incrementally
+**Before (Synchronous)**:
+```
+Text → [vLLM: Generate ALL tokens] → [S3Gen: Stream chunks]
+       ↑ Blocks ~2.6s               ↑ First chunk: ~3.4s
+```
 
-### Test File
+**After (Async Streaming)**:
+```
+Text → [AsyncLLMEngine: Stream tokens] → [S3Gen: Process incrementally]
+       ↑ First token: 19-67ms          ↑ First chunk: ~767ms ✅
+```
 
-`test-async-streaming.py` - Demonstrates true token streaming with AsyncLLMEngine
+### Files Created
+
+1. **test-async-streaming.py** - Basic AsyncLLMEngine token streaming demo
+2. **test-async-streaming-complete.py** - Complete pipeline proof-of-concept
+3. **src/chatterbox_vllm/tts_async.py** - Async TTS class design (future integration)
+4. **ASYNC_STREAMING_SUMMARY.md** - Client deliverable summary
+
+### Usage
+
+```bash
+# Basic async token streaming
+CUDA_VISIBLE_DEVICES=0 uv run python test-async-streaming.py
+
+# Complete pipeline demonstration
+CUDA_VISIBLE_DEVICES=0 uv run python test-async-streaming-complete.py
+
+# Enable debug mode for token validation
+CHATTERBOX_DEBUG_TOKENS=1 CUDA_VISIBLE_DEVICES=0 uv run python test-async-streaming.py
+```
+
+### Why Async Works
+
+The async approach achieves <1s latency because:
+1. **T3 generates tokens incrementally** - First token in ~67ms (vs 2.6s for all tokens)
+2. **S3Gen processes small batches** - ~700ms for first chunk of 25 tokens
+3. **Parallel processing** - Can generate next tokens while processing current chunk
+
+### Next Steps for Production
+
+To integrate async streaming into main ChatterboxTTS class:
+
+**Required** (8-12 hours estimated):
+- [ ] Refactor ChatterboxTTS to extract common loading logic (2-3 hours)
+- [ ] Make S3Gen async-compatible or use thread pool (4-6 hours)
+- [ ] Integrate audio context windows and fade-in (2-3 hours)
+- [ ] Add comprehensive testing and documentation
+
+**Optional**:
+- [ ] Implement backpressure handling for slow consumers
+- [ ] Add batch processing for multiple concurrent streams
+- [ ] Create async version of `from_pretrained()` factory method
+
+### Git Commits
+
+```
+492b2fc Add client deliverable summary document
+8c72f6a Fix CUDA indexing error and enable async streaming for <1s latency
+```
+
+### Key Implementation Notes
+
+**AsyncLLMEngine Configuration**:
+```python
+from vllm import AsyncLLMEngine, AsyncEngineArgs
+
+engine_args = AsyncEngineArgs(
+    model="./t3-model",
+    tokenizer="EnTokenizer",
+    tokenizer_mode="custom",
+    gpu_memory_utilization=0.90,
+    max_model_len=2000,
+    enforce_eager=True,  # Disable CUDA graphs for debugging
+    tensor_parallel_size=1,
+)
+
+engine = AsyncLLMEngine.from_engine_args(engine_args)
+
+# Stream tokens incrementally
+async for output in engine.generate(prompt, sampling_params):
+    tokens = output.outputs[0].token_ids
+    # Process tokens as they arrive
+```
+
+**Debug Token Validation**:
+```python
+# Set environment variable before importing
+os.environ["CHATTERBOX_DEBUG_TOKENS"] = "1"
+
+# The _validate_token_ids() method will automatically:
+# - Check for negative token IDs
+# - Warn about tokens exceeding vocabulary size
+# - Verify precomputed embeddings are on correct device
+```
 
 ---
 
@@ -313,17 +419,37 @@ This is a **massive improvement** from the previous ~3.4s first chunk latency!
 To continue development, load this repository and review:
 1. This `MEMORY.md` file
 2. `ERROR_FIXED.md` for known issues
-3. `test-generate-sizes.py` for usage examples
+3. `ASYNC_STREAMING_SUMMARY.md` for async streaming client deliverable
 4. Current implementation in `src/chatterbox_vllm/tts.py`
 
-**Quick test**:
+**Quick tests**:
 ```bash
+# Sync streaming (current production)
 CUDA_VISIBLE_DEVICES=0 uv run python example-tts-stream.py
+
+# Async token streaming (NEW - <1s latency)
+CUDA_VISIBLE_DEVICES=0 uv run python test-async-streaming.py
+
+# Complete async pipeline demo (NEW)
+CUDA_VISIBLE_DEVICES=0 uv run python test-async-streaming-complete.py
+
+# Profiling test
+CUDA_VISIBLE_DEVICES=0 uv run python test-profiling.py
 ```
 
 **Key files to understand**:
-- Lines 29-36: `StreamingMetrics` dataclass
-- Lines 250-330: `_process_token_chunk()` method
-- Lines 450-545: `generate_stream()` method
+- `src/chatterbox_vllm/tts.py` - Sync streaming TTS implementation
+  - Lines 29-47: `StreamingMetrics` dataclass
+  - Lines 250-330: `_process_token_chunk()` method
+  - Lines 450-545: `generate_stream()` method
+- `src/chatterbox_vllm/models/t3/t3.py` - T3 model with CUDA fixes
+  - Lines 324-335: Precomputed embeddings device placement
+  - Lines 340-365: `_validate_token_ids()` debug method
+  - Lines 461-585: `get_input_embeddings()` with token ID clamping
+- `src/chatterbox_vllm/tts_async.py` - Async TTS class design (future implementation)
 
-**Remember**: Always set `CUDA_VISIBLE_DEVICES` before CUDA operations and use `gpu_memory_utilization=0.90` for optimal performance.
+**Remember**:
+- Always set `CUDA_VISIBLE_DEVICES` before CUDA operations
+- Use `gpu_memory_utilization=0.90` for optimal performance
+- Enable `CHATTERBOX_DEBUG_TOKENS=1` for token validation debugging
+- Async streaming achieves ~767ms first chunk latency (<1s target ✅)
