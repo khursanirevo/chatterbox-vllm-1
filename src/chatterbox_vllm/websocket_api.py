@@ -41,7 +41,7 @@ args = None
 DEFAULT_PARAMS = {
     "temperature": 0.8,
     "max_tokens": 500,
-    "chunk_size": 25,
+    "chunk_size": 15,  # Reduced from 25 for faster first chunk
     "context_window": 50,
     "diffusion_steps": 5,  # Faster generation
 }

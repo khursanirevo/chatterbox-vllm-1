@@ -67,6 +67,7 @@ class AsyncChatterboxTTS:
         device: str,
         variant: str = "english",
         s3gen_stream_pool: Optional[S3GenStreamPool] = None,
+        default_chunk_size: int = 25,
     ):
         self.engine = engine
         self.s3gen = s3gen
@@ -76,6 +77,7 @@ class AsyncChatterboxTTS:
         self.device = device
         self.variant = variant
         self.s3gen_stream_pool = s3gen_stream_pool
+        self.default_chunk_size = default_chunk_size
 
     @classmethod
     async def from_pretrained(
@@ -89,6 +91,7 @@ class AsyncChatterboxTTS:
         s3gen_use_fp16: bool = False,
         enable_stream_pool: bool = True,
         num_s3gen_streams: int = 12,
+        default_chunk_size: int = 25,
         **kwargs
     ) -> "AsyncChatterboxTTS":
         """
@@ -104,6 +107,7 @@ class AsyncChatterboxTTS:
             s3gen_use_fp16: Use FP16 for S3Gen (faster, slight quality loss)
             enable_stream_pool: Enable CUDA stream pool for concurrent S3Gen inference
             num_s3gen_streams: Number of CUDA streams in the pool
+            default_chunk_size: Default speech tokens per audio chunk
             **kwargs: Additional arguments for AsyncEngineArgs
         """
         if model_path is None:
@@ -303,6 +307,7 @@ class AsyncChatterboxTTS:
             device=target_device,
             variant=variant,
             s3gen_stream_pool=s3gen_stream_pool,
+            default_chunk_size=default_chunk_size,
         )
 
         # Store additional components needed for conditioning
@@ -407,7 +412,7 @@ class AsyncChatterboxTTS:
         max_tokens: int = 500,
         top_p: float = 0.95,
         repetition_penalty: float = 1.0,
-        chunk_size: int = 25,
+        chunk_size: Optional[int] = None,
         context_window: int = 50,
         fade_duration: float = 0.02,
         diffusion_steps: int = 10,
@@ -428,7 +433,7 @@ class AsyncChatterboxTTS:
             max_tokens: Maximum tokens to generate
             top_p: Top-p sampling parameter
             repetition_penalty: Repetition penalty
-            chunk_size: Speech tokens per audio chunk
+            chunk_size: Speech tokens per audio chunk (uses default_chunk_size if None)
             context_window: Context tokens for continuity between chunks
             fade_duration: Fade-in duration in seconds between chunks
             diffusion_steps: S3Gen diffusion steps
@@ -441,6 +446,10 @@ class AsyncChatterboxTTS:
         """
         start_time = time.time()
         metrics = StreamingMetrics()
+
+        # Use default chunk size if not specified
+        if chunk_size is None:
+            chunk_size = self.default_chunk_size
 
         # Track setup timing
         setup_start = time.time()
