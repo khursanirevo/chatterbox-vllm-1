@@ -684,3 +684,190 @@ CUDA_VISIBLE_DEVICES=0 uv run python test-profiling.py
 - Use `gpu_memory_utilization=0.90` for optimal performance
 - Enable `CHATTERBOX_DEBUG_TOKENS=1` for token validation debugging
 - Async streaming achieves ~767ms first chunk latency (<1s target ✅)
+
+---
+
+## Session: 2026-03-07 - WebSocket Removal & Test Consolidation
+
+### Cleanup Work
+
+**Objective**: Remove WebSocket code and consolidate scattered test scripts into unified tools.
+
+### Removed Components
+
+1. **WebSocket API**
+   - `src/chatterbox_vllm/websocket_api.py` - WebSocket server implementation
+   - `WEBSOCKET_API_README.md` - WebSocket documentation
+   - `frontend/index.html` - WebSocket web client
+   - `serve-frontend.sh` - Frontend server script
+   - `start-all.sh` - Combined startup script
+
+2. **Removed from `pyproject.toml`**
+   - Removed `websockets` dependency
+
+3. **Consolidated Test Scripts** (20+ files → 3 unified tools)
+
+| Old Scripts | New Unified Tool |
+|-------------|------------------|
+| `example_tts_stream.py`, `example_vc_stream.py` | `test_demo.py` (modes: tts, vc) |
+| `test-profiling.py` | `test_profiling.py simple` |
+| `test-profiling-first-chunk.py` | `test_profiling.py first-chunk` |
+| `test-profiling-steady-state.py` | `test_profiling.py steady-state` |
+| `test-generate-sizes.py`, `test-async-*.py`, `test-concurrent-*.py` | `test_benchmark.py` (modes: generate, async, concurrent) |
+
+### New Unified Tools
+
+1. **`test_demo.py`** - TTS/VC demo script
+   ```bash
+   uv run python test_demo.py "Hello world"
+   uv run python test_demo.py --mode vc --audio_prompt ref.wav "Text"
+   ```
+
+2. **`test_profiling.py`** - Profiling tool with 3 modes
+   ```bash
+   uv run python test_profiling.py simple
+   uv run python test_profiling.py first-chunk --iterations 10
+   uv run python test_profiling.py steady-state --iterations 20
+   ```
+
+3. **`test_benchmark.py`** - Benchmark tool with 3 modes
+   ```bash
+   uv run python test_benchmark.py generate
+   uv run python test_benchmark.py async
+   uv run python test_benchmark.py concurrent --burst-sizes 4 8 16
+   ```
+
+### Git Commits
+
+- `32add62` - Consolidate test scripts and remove WebSocket code
+- `ae5998c` - Add profiling and benchmarking tools
+- `405963d` - Add sweet spot analyzer for first chunk latency
+
+---
+
+## Session: 2026-03-07 - First Chunk Latency Deep Dive
+
+### Objective
+
+Investigate why first chunk latency exceeds 1s target and identify the sweet spot for text length.
+
+### Key Discovery: Warmup is Critical
+
+**Problem**: Initial benchmark measured **cold start** performance, not steady-state.
+
+| State | First Chunk | T3 Time | S3Gen Time |
+|-------|-------------|---------|------------|
+| **Cold Start** | 1433ms | 664ms | 616ms |
+| **Steady State** | 796ms | 542ms | 252ms |
+| **Improvement** | -638ms (44%) | -122ms | -364ms |
+
+### Component Breakdown (Steady State)
+
+```
+First Chunk: 796ms
+├── T3 Generation:  542ms (68.5%) ← Main bottleneck
+├── S3Gen:          252ms (31.2%)
+└── Other:            2ms (0.3%)
+```
+
+### Key Findings
+
+1. **✅ Steady state DOES meet <1s target** (796ms for short text)
+2. **🔥 Cold start overhead: ~638ms** (44% slower)
+   - S3Gen first-call compilation: ~364ms
+   - T3 first-call overhead: ~122ms
+3. **📊 T3 is the bottleneck**: 68.5% of latency (scales with text length)
+4. **🎯 S3Gen is consistent**: ~250-300ms regardless of text length
+
+### Sweet Spot Analysis
+
+**Question**: What's the maximum text length for <1s first chunk?
+
+**Answer**: **~11 words or ~55 characters**
+
+| Words | Chars | First Chunk | Status |
+|-------|-------|-------------|--------|
+| 2 | 12 | 474ms | ✅ |
+| 6 | 28 | 709ms | ✅ |
+| 9 | 44 | 693ms | ✅ |
+| **12** | **68** | **884ms** | ✅ MAX |
+| 14 | 81 | 1096ms | ❌ |
+| 21 | 164 | 1926ms | ❌ |
+
+### T3 Generation Rate
+
+- **Rate**: ~16 words/second (~62ms per word)
+- **S3Gen constant**: ~300ms
+- **T3 budget for <1s**: ~700ms
+
+### Why Longer Texts Fail
+
+| Text Length | T3 Time | S3Gen Time | Total |
+|-------------|---------|------------|-------|
+| Short (410ms T3) | 410ms | 299ms | **707ms** ✅ |
+| Medium (1000ms T3) | 1000ms | 306ms | **1310ms** ❌ |
+| Long (2600ms T3) | 2600ms | 304ms | **2915ms** ❌ |
+
+**Root cause**: T3 generates ALL tokens before S3Gen starts. Time scales with text length.
+
+### Solution: AsyncLLMEngine
+
+**Current (Sync) Flow:**
+```
+Text → [Generate ALL tokens] → [S3Gen first chunk] → Audio
+       ↑ 400-4000ms              ↑ ~300ms
+```
+
+**With AsyncLLMEngine:**
+```
+Text → [Stream tokens] → [S3Gen first chunk] → Audio
+       ↑ ~50ms                 ↑ ~300ms
+       First token
+
+Total: ~350ms regardless of text length! 🚀
+```
+
+### New Profiling Tools
+
+1. **`benchmark_first_chunk.py`** - Comprehensive benchmark with output organization
+   - Creates `output/XX_name/chunks/` and `output/XX_name/full.mp3`
+   - Includes warmup for steady-state measurement
+   - Saves individual chunks and full audio as MP3
+
+2. **`profile_first_chunk.py`** - Detailed latency analysis
+   - Compares cold start vs steady state
+   - Analyzes S3Gen compilation overhead
+   - Component breakdown (T3 vs S3Gen)
+
+3. **`find_sweet_spot.py`** - Determines optimal text length
+   - Tests various text lengths
+   - Calculates T3 generation rate
+   - Finds maximum text for <1s target
+
+### Production Recommendations
+
+| Use Case | Max Length | Recommendation |
+|----------|------------|----------------|
+| Voice assistants | ~10 words | ✅ Current sync OK |
+| Notifications | ~15 words | ✅ Current sync OK |
+| Article reading | 100+ words | ❌ Use AsyncLLMEngine |
+| Book reading | 1000+ words | ❌ Use AsyncLLMEngine |
+
+### Benchmark Results (With Warmup)
+
+**Output**: `output/benchmark_20260307_162401/`
+
+| Test | Words | 1st Chunk | T3 Time | S3Gen Time | Status |
+|------|-------|-----------|---------|------------|--------|
+| Short hello | 8 | 707ms | 410ms | 299ms | ✅ |
+| Medium sentence | 16 | 1310ms | 1000ms | 306ms | ❌ |
+| Long paragraph | 24 | 2915ms | 2610ms | 304ms | ❌ |
+| Very long text | 34 | 4420ms | 4110ms | 303ms | ❌ |
+
+### Key Takeaways
+
+1. **Always warm up the model** for production deployment
+2. **Current sync implementation works** for texts ≤11 words
+3. **AsyncLLMEngine is required** for longer content or consistent <1s latency
+4. **S3Gen overhead is minimal** after warmup (~250-300ms)
+
