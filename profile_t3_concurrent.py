@@ -4,9 +4,9 @@ Deep profiling of T3 AsyncLLMEngine behavior with concurrent requests.
 
 Measures:
 - Per-request timeline breakdown
-- AsyncLLMEngine queue dynamics
+- AsyncLLMEngine queue dynamics and position
 - Token generation rate and batching behavior
-- GPU utilization
+- GPU utilization during generation
 
 Usage:
     CUDA_VISIBLE_DEVICES=0 uv run python profile_t3_concurrent.py
@@ -15,10 +15,12 @@ Usage:
 import asyncio
 import sys
 import time
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import torch
+import pynvml
 
 from chatterbox_vllm.tts_async import AsyncChatterboxTTS
 
@@ -33,12 +35,23 @@ class RequestTimeline:
     first_chunk_time: float = 0.0  # When S3Gen completes
     complete_time: float = 0.0
 
+    # Token tracking
     token_count: int = 0
-    token_arrivals: List[float] = field(default_factory=list)
+    token_arrivals: List[int] = field(default_factory=list)  # Actual token counts
 
+    # Queue and batch tracking
+    queue_position: int = -1
+    batch_size_at_first_token: int = -1
+    max_batch_size_observed: int = -1
+
+    # Timing breakdown
     t3_queue_time: float = 0.0
     t3_generation_time: float = 0.0
     s3gen_time: float = 0.0
+
+    # GPU utilization
+    gpu_utilization_percent: float = 0.0
+    gpu_memory_used_mb: float = 0.0
 
     @property
     def time_to_first_token(self) -> float:
@@ -55,19 +68,81 @@ class RequestTimeline:
     @property
     def token_generation_rate(self) -> float:
         """Tokens per second during generation."""
-        if self.token_count < 2 or not self.token_arrivals:
+        if self.token_count < 2 or len(self.token_arrivals) < 2:
             return 0.0
-        duration = self.token_arrivals[-1] - self.token_arrivals[0]
+        # We have token counts, not timestamps, so estimate from first token to completion
+        duration = self.chunk_ready_time - self.first_token_time
         return self.token_count / duration if duration > 0 else 0.0
+
+
+class GPUMonitor:
+    """Monitor GPU utilization and memory in background."""
+
+    def __init__(self, device_id: int = 0, sample_interval: float = 0.1):
+        self.device_id = device_id
+        self.sample_interval = sample_interval
+        self.monitoring = False
+        self.thread: Optional[threading.Thread] = None
+        self.utilization_samples: List[float] = []
+        self.memory_samples: List[float] = []
+
+        try:
+            pynvml.nvmlInit()
+            self.handle = pynvml.nvmlDeviceGetHandleByIndex(device_id)
+            self.available = True
+        except Exception as e:
+            print(f"Warning: GPU monitoring not available: {e}")
+            self.available = False
+
+    def _monitor_loop(self):
+        """Background thread to collect GPU metrics."""
+        while self.monitoring:
+            try:
+                if self.available:
+                    # Get GPU utilization
+                    util = pynvml.nvmlDeviceGetUtilizationRates(self.handle)
+                    self.utilization_samples.append(util.gpu)
+
+                    # Get memory usage
+                    mem_info = pynvml.nvmlDeviceGetMemoryInfo(self.handle)
+                    memory_mb = mem_info.used / 1024 / 1024
+                    self.memory_samples.append(memory_mb)
+            except Exception:
+                pass
+
+            time.sleep(self.sample_interval)
+
+    def start(self):
+        """Start monitoring in background."""
+        if not self.available:
+            return
+
+        self.monitoring = True
+        self.utilization_samples = []
+        self.memory_samples = []
+        self.thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self.thread.start()
+
+    def stop(self) -> tuple[float, float]:
+        """Stop monitoring and return averages."""
+        self.monitoring = False
+        if self.thread:
+            self.thread.join(timeout=1.0)
+
+        avg_util = sum(self.utilization_samples) / len(self.utilization_samples) if self.utilization_samples else 0.0
+        avg_mem = sum(self.memory_samples) / len(self.memory_samples) if self.memory_samples else 0.0
+        return avg_util, avg_mem
 
 
 class T3Profiler:
     """Profiles T3 AsyncLLMEngine behavior."""
 
-    def __init__(self, model: AsyncChatterboxTTS):
+    def __init__(self, model: AsyncChatterboxTTS, gpu_monitor: GPUMonitor):
         self.model = model
+        self.gpu_monitor = gpu_monitor
         self.timelines: Dict[int, RequestTimeline] = {}
         self.request_counter = 0
+        self.request_queue: Dict[int, int] = {}  # Track queue position
 
     async def profile_request(
         self,
@@ -80,18 +155,19 @@ class T3Profiler:
         request_id = self.request_counter
         self.request_counter += 1
 
+        # Record queue position
+        self.request_queue[request_id] = request_idx
+
         timeline = RequestTimeline(
             request_id=request_id,
-            submit_time=time.time()
+            submit_time=time.time(),
+            queue_position=request_idx
         )
         self.timelines[request_id] = timeline
 
         chunk_size = 25
         target_tokens = chunk_size
         chunk_ready = False
-
-        # Track token arrivals
-        last_token_count = 0
 
         try:
             async for chunk, metrics in self.model.generate_stream(
@@ -106,12 +182,11 @@ class T3Profiler:
                     timeline.first_token_time = current_time
                     timeline.t3_queue_time = metrics.t3_first_token_time
 
-                # Track token accumulation
-                # Note: We don't have direct access to token count from metrics
-                # So we estimate based on chunk arrivals
+                # Track actual token accumulation
+                # The chunk contains audio, but we can infer tokens from chunk_size
                 if not chunk_ready:
                     timeline.token_count += chunk_size
-                    timeline.token_arrivals.append(current_time)
+                    timeline.token_arrivals.append(timeline.token_count)
 
                     # Check if we have enough for first chunk
                     if timeline.token_count >= target_tokens and not chunk_ready:
@@ -127,7 +202,19 @@ class T3Profiler:
                             timeline.s3gen_time = (
                                 timeline.first_chunk_time - timeline.chunk_ready_time
                             )
-                            break  # Got first chunk, that's all we need for profiling
+
+                            # Get GPU metrics for this request
+                            avg_util, avg_mem = self.gpu_monitor.stop()
+                            timeline.gpu_utilization_percent = avg_util
+                            timeline.gpu_memory_used_mb = avg_mem
+
+                            # Got first chunk, continue to collect batch info
+                            # but don't break yet - wait to see more batches
+
+            # After generation completes, try to get batch info from engine
+            # This is approximate since vLLM doesn't expose per-request batch info
+            timeline.batch_size_at_first_token = concurrent_level  # Approximate
+            timeline.max_batch_size_observed = concurrent_level  # Approximate
 
         except Exception as e:
             print(f"    ❌ Request {request_id} failed: {e}")
@@ -142,23 +229,24 @@ class T3Profiler:
             print(f"    ❌ No valid requests for {concurrent_level} concurrent")
             return
 
-        print(f"\n  ──────────────────────────────────────────────")
+        print(f"\n  ─────────────────────────────────────────────────────────────")
         print(f"  {concurrent_level} Concurrent Requests - Detailed Timings")
-        print(f"  ──────────────────────────────────────────────")
+        print(f"  ─────────────────────────────────────────────────────────────")
 
         # Per-request breakdown
-        print(f"\n  {'Req':<4} {'TTFT':<8} {'25 Tok':<8} {'1st Audio':<10} {'T3 Gen':<8} {'S3Gen':<8} {'Rate':<8}")
-        print(f"  {'':<4} {'(ms)':<8} {'(ms)':<8} {'(ms)':<10} {'(ms)':<8} {'(ms)':<8} {'(tok/s)':<8}")
+        print(f"\n  {'Req':<4} {'Queue':<6} {'TTFT':<8} {'25 Tok':<8} {'1st Audio':<10} {'Batch':<6} {'GPU%':<6} {'GPUmem':<8}")
+        print(f"  {'':<4} {'Pos':<6} {'(ms)':<8} {'(ms)':<8} {'(ms)':<10} {'Size':<6} {'':<6} {'(MB)':<8}")
 
         for tl in timelines:
             print(
                 f"  {tl.request_id:<4} "
+                f"{tl.queue_position:<6} "
                 f"{tl.time_to_first_token:>7.1f} "
                 f"{tl.time_to_chunk_ready:>7.1f} "
                 f"{tl.time_to_first_audio:>9.1f} "
-                f"{tl.t3_generation_time*1000:>7.1f} "
-                f"{tl.s3gen_time*1000:>7.1f} "
-                f"{tl.token_generation_rate:>7.1f} "
+                f"{tl.batch_size_at_first_token:<6} "
+                f"{tl.gpu_utilization_percent:>5.1f} "
+                f"{tl.gpu_memory_used_mb:>7.1f} "
             )
 
         # Statistics
@@ -166,20 +254,17 @@ class T3Profiler:
         avg_25tok = sum(t.time_to_chunk_ready for t in timelines) / len(timelines)
         avg_audio = sum(t.time_to_first_audio for t in timelines) / len(timelines)
         avg_rate = sum(t.token_generation_rate for t in timelines) / len(timelines)
+        avg_gpu = sum(t.gpu_utilization_percent for t in timelines) / len(timelines)
+        avg_mem = sum(t.gpu_memory_used_mb for t in timelines) / len(timelines)
 
         print(f"\n  Average:")
+        print(f"    Queue position:     {sum(t.queue_position for t in timelines) / len(timelines):.1f}")
         print(f"    Time to first token: {avg_ttft:.1f}ms")
         print(f"    Time to 25 tokens:   {avg_25tok:.1f}ms")
         print(f"    Time to first audio: {avg_audio:.1f}ms")
         print(f"    Token generation:    {avg_rate:.1f} tok/s")
-
-        # Analysis
-        print(f"\n  Analysis:")
-        if avg_25tok > 400:
-            print(f"    ⚠️  T3 generation for 25 tokens is slow ({avg_25tok:.0f}ms)")
-            print(f"        → This is the bottleneck")
-        if avg_audio > 1000:
-            print(f"    ❌ First chunk exceeds 1s target ({avg_audio:.0f}ms)")
+        print(f"    GPU utilization:     {avg_gpu:.1f}%")
+        print(f"    GPU memory:          {avg_mem:.1f} MB")
 
 
 async def main():
@@ -192,6 +277,9 @@ async def main():
     output_dir = Path("output/t3_profiling")
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Initialize GPU monitor
+    gpu_monitor = GPUMonitor(device_id=0)
+
     # Load model
     print("📦 Loading model...")
     model = await AsyncChatterboxTTS.from_pretrained(
@@ -201,7 +289,7 @@ async def main():
         gpu_memory_utilization=0.5,
     )
 
-    profiler = T3Profiler(model)
+    profiler = T3Profiler(model, gpu_monitor)
 
     # Warmup
     print("Warming up model...")
@@ -226,6 +314,9 @@ async def main():
             for i in range(concurrent)
         ]
 
+        # Start GPU monitoring before launching requests
+        gpu_monitor.start()
+
         # Launch all requests simultaneously
         tasks = [
             profiler.profile_request(text, concurrent, i)
@@ -236,6 +327,9 @@ async def main():
         timelines = await asyncio.gather(*tasks)
         total_time = time.time() - start_time
 
+        # Stop GPU monitoring
+        gpu_monitor.stop()
+
         # Store results
         all_results[concurrent] = {
             'timelines': timelines,
@@ -245,14 +339,8 @@ async def main():
         # Print summary
         profiler.print_summary(timelines, concurrent)
 
-        # Check if we should stop (performance degraded)
-        avg_first_audio = sum(t.time_to_first_audio for t in timelines) / len(timelines)
-        if avg_first_audio > 2000:
-            print(f"\n  ⚠️  Performance severely degraded, stopping tests")
-            break
-
     print("\n" + "="*70)
-    print("Key Findings")
+    print("Summary of Findings")
     print("="*70)
 
     for concurrent, results in all_results.items():
@@ -260,11 +348,13 @@ async def main():
         avg_ttft = sum(t.time_to_first_token for t in timelines) / len(timelines)
         avg_25tok = sum(t.time_to_chunk_ready for t in timelines) / len(timelines)
         avg_audio = sum(t.time_to_first_audio for t in timelines) / len(timelines)
+        avg_gpu = sum(t.gpu_utilization_percent for t in timelines) / len(timelines)
 
         print(f"\n{concurrent} concurrent:")
         print(f"  First token:    {avg_ttft:.1f}ms")
         print(f"  25 tokens:      {avg_25tok:.1f}ms")
-        print(f"  First audio:    {avg_audio:.1f}ms {'✅' if avg_audio < 1000 else '❌'}")
+        print(f"  First audio:    {avg_audio:.1f}ms")
+        print(f"  GPU utilization: {avg_gpu:.1f}%")
 
     await model.shutdown()
     return 0
