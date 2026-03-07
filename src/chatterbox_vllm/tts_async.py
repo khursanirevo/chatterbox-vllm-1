@@ -39,6 +39,7 @@ from chatterbox_vllm.models.t3.modules.cond_enc import T3Cond, T3CondEnc
 from chatterbox_vllm.models.t3.modules.learned_pos_emb import LearnedPositionEmbeddings
 from chatterbox_vllm.text_utils import punc_norm, SUPPORTED_LANGUAGES
 from chatterbox_vllm.tts import Conditionals, StreamingMetrics
+from chatterbox_vllm.s3gen_stream_pool import S3GenStreamPool
 
 REPO_ID = "ResembleAI/chatterbox"
 
@@ -65,6 +66,7 @@ class AsyncChatterboxTTS:
         max_model_len: int,
         device: str,
         variant: str = "english",
+        s3gen_stream_pool: Optional[S3GenStreamPool] = None,
     ):
         self.engine = engine
         self.s3gen = s3gen
@@ -73,6 +75,7 @@ class AsyncChatterboxTTS:
         self.max_model_len = max_model_len
         self.device = device
         self.variant = variant
+        self.s3gen_stream_pool = s3gen_stream_pool
 
     @classmethod
     async def from_pretrained(
@@ -84,6 +87,8 @@ class AsyncChatterboxTTS:
         gpu_memory_utilization: float = 0.90,
         enforce_eager: bool = True,
         s3gen_use_fp16: bool = False,
+        enable_stream_pool: bool = True,
+        num_s3gen_streams: int = 12,
         **kwargs
     ) -> "AsyncChatterboxTTS":
         """
@@ -97,6 +102,8 @@ class AsyncChatterboxTTS:
             gpu_memory_utilization: GPU memory utilization (0.0-1.0)
             enforce_eager: Disable CUDA graphs (useful for debugging)
             s3gen_use_fp16: Use FP16 for S3Gen (faster, slight quality loss)
+            enable_stream_pool: Enable CUDA stream pool for concurrent S3Gen inference
+            num_s3gen_streams: Number of CUDA streams in the pool
             **kwargs: Additional arguments for AsyncEngineArgs
         """
         if model_path is None:
@@ -274,6 +281,18 @@ class AsyncChatterboxTTS:
         default_conds = Conditionals.load(conds_path)
         default_conds.to(device=target_device)
 
+        # Create stream pool if enabled
+        s3gen_stream_pool = None
+        if enable_stream_pool:
+            print(f"Creating S3Gen stream pool with {num_s3gen_streams} streams...")
+            s3gen_stream_pool = S3GenStreamPool(
+                s3gen_model=s3gen,
+                num_streams=num_s3gen_streams,
+                device=target_device,
+            )
+            await s3gen_stream_pool.initialize()
+            print("✓ Stream pool initialized!")
+
         # Create instance
         instance = cls(
             engine=engine,
@@ -283,6 +302,7 @@ class AsyncChatterboxTTS:
             max_model_len=max_model_len,
             device=target_device,
             variant=variant,
+            s3gen_stream_pool=s3gen_stream_pool,
         )
 
         # Store additional components needed for conditioning
@@ -422,9 +442,13 @@ class AsyncChatterboxTTS:
         start_time = time.time()
         metrics = StreamingMetrics()
 
+        # Track setup timing
+        setup_start = time.time()
+
         # Get conditionals
         s3gen_ref, cond_emb = self.get_audio_conditionals(audio_prompt_path)
         cond_emb = self.update_exaggeration(cond_emb, exaggeration)
+        conditionals_time = time.time() - setup_start
 
         # Validate language
         if self.variant == "multilingual":
@@ -435,9 +459,11 @@ class AsyncChatterboxTTS:
             lang_code = None
 
         # Normalize and prepare text
+        text_prep_start = time.time()
         text_normalized = "[START]" + punc_norm(text) + "[STOP]"
         if lang_code:
             text_normalized = f"<|{lang_code}|> {text_normalized}"
+        text_prep_time = time.time() - text_prep_start
 
         # Setup sampling parameters
         sampling_params = SamplingParams(
@@ -453,6 +479,11 @@ class AsyncChatterboxTTS:
         first_token_time = None
         t3_start_time = time.time()
         last_yield_time = t3_start_time
+
+        # Initialize granular timing variables
+        token_conversion_time = 0.0
+        context_prep_time = 0.0
+        chunk_prep_time = 0.0
 
         request_id = f"tts-request-{time.time()}"
 
@@ -509,17 +540,20 @@ class AsyncChatterboxTTS:
                             break
 
                         # Extract NEW chunk (tokens we haven't processed yet)
+                        chunk_prep_start = time.time()
                         chunk_start_idx = last_processed_count + offset
                         chunk_end_idx = chunk_start_idx + current_chunk_size
                         token_chunk = all_tokens[chunk_start_idx:chunk_end_idx]
 
                         # Convert to speech tokens (subtract offset)
+                        token_conversion_start = time.time()
                         token_chunk_tensor = torch.tensor(
                             [token - SPEECH_TOKEN_OFFSET for token in token_chunk],
                             device="cuda"
                         )
                         token_chunk_tensor = drop_invalid_tokens(token_chunk_tensor.unsqueeze(0))
                         token_chunk_tensor = token_chunk_tensor[token_chunk_tensor < 6561]
+                        token_conversion_time = time.time() - token_conversion_start
 
                         if token_chunk_tensor.numel() == 0:
                             offset += current_chunk_size
@@ -527,6 +561,7 @@ class AsyncChatterboxTTS:
                             continue
 
                         # Get context for continuity (convert all PREVIOUS tokens to speech tokens)
+                        context_prep_start = time.time()
                         if chunk_start_idx > 0:
                             context_tokens_list = [
                                 t - SPEECH_TOKEN_OFFSET for t in all_tokens[:chunk_start_idx]
@@ -536,6 +571,8 @@ class AsyncChatterboxTTS:
                             context_tokens_tensor = context_tokens_tensor[context_tokens_tensor < 6561]
                         else:
                             context_tokens_tensor = None
+                        context_prep_time = time.time() - context_prep_start
+                        chunk_prep_time = time.time() - chunk_prep_start
 
                         # Process tokens to audio
                         s3gen_start = time.time()
@@ -552,10 +589,24 @@ class AsyncChatterboxTTS:
                         # Update metrics
                         if metrics.chunk_count == 0:
                             metrics.latency_to_first_chunk = current_time - start_time
-                            metrics.s3gen_first_chunk_time = current_time - first_token_time
+                            if first_token_time is not None:
+                                metrics.s3gen_first_chunk_time = current_time - first_token_time
+                                metrics.t3_token_generation_time = first_token_time - t3_start_time
                             metrics.first_s3gen_inference_time = s3gen_time
+                            # Store granular first-chunk timing
+                            metrics.conditionals_prep_ms = conditionals_time * 1000
+                            metrics.text_prep_ms = text_prep_time * 1000
+                            metrics.token_conversion_ms = token_conversion_time * 1000
+                            metrics.context_prep_ms = context_prep_time * 1000
+                            metrics.chunk_prep_overhead_ms = max(0, (chunk_prep_time - token_conversion_time - context_prep_time) * 1000)
                             if print_metrics:
-                                print(f"[DEBUG] First chunk S3Gen: {s3gen_time*1000:.2f}ms")
+                                print(f"[DEBUG] First chunk breakdown:")
+                                print(f"  Conditionals: {conditionals_time*1000:.2f}ms")
+                                print(f"  Text prep: {text_prep_time*1000:.2f}ms")
+                                print(f"  Token conversion: {token_conversion_time*1000:.2f}ms")
+                                print(f"  Context prep: {context_prep_time*1000:.2f}ms")
+                                print(f"  Chunk prep overhead: {max(0, (chunk_prep_time - token_conversion_time - context_prep_time))*1000:.2f}ms")
+                                print(f"  S3Gen inference: {s3gen_time*1000:.2f}ms")
 
                         metrics.chunk_count += 1
                         metrics.last_chunk_time = current_time - start_time
@@ -713,6 +764,10 @@ class AsyncChatterboxTTS:
     async def shutdown(self):
         """Cleanup resources."""
         import gc
+        # Shutdown stream pool if present
+        if self.s3gen_stream_pool is not None:
+            print("Shutting down stream pool...")
+            await self.s3gen_stream_pool.shutdown()
         # Delete the engine to trigger cleanup
         if hasattr(self, 'engine'):
             del self.engine
