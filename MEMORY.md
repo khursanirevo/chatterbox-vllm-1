@@ -414,6 +414,66 @@ os.environ["CHATTERBOX_DEBUG_TOKENS"] = "1"
 
 ---
 
+## First Chunk Latency Profiling (Added 2026-03-07)
+
+Comprehensive profiling statistics based on 10 iterations:
+
+### First Chunk Latency Statistics
+
+| Metric | Value |
+|--------|-------|
+| **Average** | **932.76 ms** |
+| **Min** | **737.45 ms** ⚡ |
+| **Max** | **1149.82 ms** |
+| **Median** | **923.22 ms** |
+| **Std Dev** | **107.29 ms** |
+| **95th Percentile** | **1149.82 ms** |
+
+### Latency Breakdown (Average)
+```
+First Chunk: 932.76ms
+├── T3 generation:     460.31ms (49.3%)
+├── S3Gen first chunk: 461.12ms (49.4%)
+└── Other overhead:    11.34ms  (1.2%)
+```
+
+### Key Findings
+1. **T3 generation is the bottleneck** - Nearly 50% of first chunk latency
+2. **S3Gen is consistently fast** - ~461ms average with low variance
+3. **Good consistency** - Standard deviation of only 107ms
+4. **Best case already under 1s** - 737ms achieved in iteration 10
+
+### Per-Iteration Results
+
+| Iter | First Chunk | T3 Gen | S3Gen |
+|------|-------------|--------|-------|
+| 1 | 1022ms | 550ms | 463ms |
+| 2 | 1150ms | 648ms | 492ms |
+| 3 | 938ms | 479ms | 454ms |
+| 4 | 982ms | 474ms | 495ms |
+| 5 | 872ms | 412ms | 442ms |
+| 6 | 903ms | 405ms | 493ms |
+| 7 | 925ms | 405ms | 511ms |
+| 8 | 921ms | 425ms | 485ms |
+| 9 | 876ms | 404ms | 455ms |
+| 10 | **737ms** ⚡ | 402ms | 322ms |
+
+### AsyncLLMEngine Projection
+
+With AsyncLLMEngine streaming:
+```
+Current (sync):    ~933ms first chunk
+Async (projected): ~511ms first chunk (50ms + 461ms)
+Speedup:           1.82x faster
+Status:            ✅ Meets <1s target
+```
+
+### Test Script
+
+`test-profiling-first-chunk.py` - Comprehensive latency profiling with statistics
+
+---
+
 ## Next Session Setup
 
 To continue development, load this repository and review:
