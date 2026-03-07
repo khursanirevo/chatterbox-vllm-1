@@ -133,3 +133,57 @@ async def test_process_async_with_context(mock_s3gen):
     mock_s3gen.inference.assert_called_once()
 
     await pool.shutdown()
+
+@pytest.mark.asyncio
+async def test_concurrent_requests(mock_s3gen):
+    """Test that multiple requests can run concurrently."""
+    pool = S3GenStreamPool(mock_s3gen, num_streams=4, device="cuda")
+    await pool.initialize()
+
+    num_requests = 8
+
+    # Create requests
+    async def make_request(i):
+        token_chunk = torch.tensor([[i, i+1, i+2, i+3, i+4]])
+        s3gen_ref = {"embedding": torch.randn(1, 80)}
+        return await pool.process_async(
+            token_chunk=token_chunk,
+            context_tokens=None,
+            s3gen_ref=s3gen_ref,
+        )
+
+    # Launch all requests concurrently
+    results = await asyncio.gather(*[make_request(i) for i in range(num_requests)])
+
+    # Verify all completed
+    assert len(results) == num_requests
+    assert all(r is not None for r in results)
+    assert pool.metrics.total_requests == num_requests
+
+    # All streams should be back in pool
+    assert pool.stream_queue.qsize() == pool.num_streams
+
+    await pool.shutdown()
+
+@pytest.mark.asyncio
+async def test_stream_reuse(mock_s3gen):
+    """Test that streams are reused properly."""
+    pool = S3GenStreamPool(mock_s3gen, num_streams=2, device="cuda")
+    await pool.initialize()
+
+    # Process more requests than streams
+    for i in range(6):
+        token_chunk = torch.tensor([[i, i+1]])
+        s3gen_ref = {"embedding": torch.randn(1, 80)}
+        result = await pool.process_async(
+            token_chunk=token_chunk,
+            context_tokens=None,
+            s3gen_ref=s3gen_ref,
+        )
+        assert result is not None
+
+    # All streams should be back in queue
+    assert pool.stream_queue.qsize() == pool.num_streams
+    assert pool.metrics.total_requests == 6
+
+    await pool.shutdown()
