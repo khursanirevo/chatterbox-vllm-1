@@ -576,14 +576,25 @@ class AsyncChatterboxTTS:
 
                         # Process tokens to audio
                         s3gen_start = time.time()
-                        audio_chunk = await self._process_token_chunk_async(
-                            token_chunk=token_chunk_tensor,
-                            context_tokens=context_tokens_tensor,
-                            s3gen_ref=s3gen_ref,
-                            context_window=context_window,
-                            fade_duration=fade_duration,
-                            diffusion_steps=diffusion_steps,
-                        )
+                        # Use stream pool if available, otherwise fall back to async method
+                        if self.s3gen_stream_pool:
+                            audio_chunk = await self.s3gen_stream_pool.process_async(
+                                token_chunk=token_chunk_tensor,
+                                context_tokens=context_tokens_tensor,
+                                s3gen_ref=s3gen_ref,
+                                context_window=context_window,
+                                fade_duration=fade_duration,
+                                diffusion_steps=diffusion_steps,
+                            )
+                        else:
+                            audio_chunk = await self._process_token_chunk_async(
+                                token_chunk=token_chunk_tensor,
+                                context_tokens=context_tokens_tensor,
+                                s3gen_ref=s3gen_ref,
+                                context_window=context_window,
+                                fade_duration=fade_duration,
+                                diffusion_steps=diffusion_steps,
+                            )
                         s3gen_time = time.time() - s3gen_start
 
                         # Update metrics
@@ -649,14 +660,25 @@ class AsyncChatterboxTTS:
                 else:
                     context_tokens_tensor = None
 
-                audio_chunk = await self._process_token_chunk_async(
-                    token_chunk=remaining_tokens_tensor.unsqueeze(0),
-                    context_tokens=context_tokens_tensor,
-                    s3gen_ref=s3gen_ref,
-                    context_window=context_window,
-                    fade_duration=fade_duration,
-                    diffusion_steps=diffusion_steps,
-                )
+                # Use stream pool if available, otherwise fall back to async method
+                if self.s3gen_stream_pool:
+                    audio_chunk = await self.s3gen_stream_pool.process_async(
+                        token_chunk=remaining_tokens_tensor.unsqueeze(0),
+                        context_tokens=context_tokens_tensor,
+                        s3gen_ref=s3gen_ref,
+                        context_window=context_window,
+                        fade_duration=fade_duration,
+                        diffusion_steps=diffusion_steps,
+                    )
+                else:
+                    audio_chunk = await self._process_token_chunk_async(
+                        token_chunk=remaining_tokens_tensor.unsqueeze(0),
+                        context_tokens=context_tokens_tensor,
+                        s3gen_ref=s3gen_ref,
+                        context_window=context_window,
+                        fade_duration=fade_duration,
+                        diffusion_steps=diffusion_steps,
+                    )
                 if audio_chunk is not None:
                     metrics.chunk_count += 1
                     metrics.total_audio_duration += audio_chunk.shape[-1] / S3GEN_SR
