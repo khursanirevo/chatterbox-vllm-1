@@ -1428,6 +1428,170 @@ CUDA_VISIBLE_DEVICES=0 uv run python verify_stream_pool.py
 - `tests/test_stream_pool_integration.py` - NEW: Integration tests
 - `verify_stream_pool.py` - NEW: Verification script
 - `MEMORY.md` - Documentation
+- `ERROR_FIXED.md` - Updated with T3 config issue
 
+---
 
+## Session: 2026-03-08 - T3 Model Architecture Deep Dive
 
+### Objective
+
+Document the correct understanding of the T3 model architecture and configuration after encountering and fixing config.json issues.
+
+### T3 Model Architecture
+
+The T3 model uses **three separate token embeddings**, not one:
+
+| Embedding | Vocab Size | Purpose |
+|-----------|-----------|---------|
+| **`text_emb`** | 704 (English) / 2454 (Multilingual) | Input text tokens from EnTokenizer |
+| **`speech_emb`** | 8194 | Speech codec tokens (EnCodec) for S3Gen |
+| **`tfmr.embed_tokens`** (LLaMA backbone) | 8 | Pre-trained LLaMA-520M base model |
+
+**Location**: `src/chatterbox_vllm/models/t3/t3.py` lines 270-277
+
+```python
+text_tokens_dict_size = 704 if self.cfg.tokenizer == "EnTokenizer" else 2454
+self.text_emb = nn.Embedding(text_tokens_dict_size, self.dim)  # For text
+self.speech_emb = nn.Embedding(self.t3conf.speech_tokens_dict_size, self.dim)  # For speech
+self.tfmr = LlamaModel(vllm_config=vllm_config, ...)  # LLaMA with vocab_size=8
+```
+
+### Why config.json Has vocab_size=8
+
+The `vocab_size: 8` in `t3-model/config.json` describes **only the LLaMA backbone**, not the actual working vocabulary.
+
+**Why this works**:
+- LLaMA backbone (vocab_size=8) is a pre-trained base model
+- T3 doesn't actually use `tfmr.embed_tokens` for text/speech
+- T3 uses custom `text_emb` and `speech_emb` instead
+- This is an architectural choice to reuse the LLaMA transformer while having custom token embeddings
+
+### Why hidden_size=2048 is Critical
+
+The T3 model uses **Classifier-Free Guidance (CFG)** which requires double the hidden dimensions:
+
+```python
+# In t3.py forward method (line 691):
+cond_embeds, uncond_embeds = inputs_embeds.split([self.dim, self.dim], dim=1)
+# This splits 2048 dims into [1024, 1024]
+```
+
+**CFG workflow**:
+1. Concatenate conditional + unconditional embeddings: `[1024 + 1024 = 2048]`
+2. Split them: `cond_embeds, uncond_embeds = inputs_embeds.split([1024, 1024])`
+3. Process through transformer
+4. Combine with CFG scale: `cond_logits + cfg_scale * (cond_logits - uncond_logits)`
+
+**Setting `hidden_size: 1024` breaks this** because the split fails: `split([1024, 1024]) requires 2048 dims!`
+
+### The SPEECH_TOKEN_OFFSET Trick
+
+```python
+SPEECH_TOKEN_OFFSET = 2500  # t3.py line 49
+```
+
+**Purpose**: Distinguish between prefill and decode tokens in the same sequence
+
+| Token Range | Purpose |
+|-------------|---------|
+| 0-2499 | Prefill tokens (conditionals, speaker embedding, text) |
+| 2500-10693 | Speech generation tokens (2500 + actual 0-8193) |
+
+**In token processing**:
+```python
+# Decode mode (line 504):
+adjusted_ids = torch.clamp(ids - SPEECH_TOKEN_OFFSET, 0, speech_tokens_dict_size - 1)
+# Subtracts 2500 from token IDs to get actual speech token IDs
+
+# In logits (line 663):
+logits = torch.cat([
+    torch.zeros(logits.shape[0], SPEECH_TOKEN_OFFSET).fill_(float('-inf')),  # 2500 fake dims
+    logits,  # 8194 speech token logits
+], dim=1)
+# Adds 2500 fake dims to offset the output logits
+```
+
+### Effective Vocabulary Size
+
+```
+Working vocabulary = SPEECH_TOKEN_OFFSET + speech_tokens_dict_size
+                     2500           +         8194
+                   = 10,694 total tokens
+```
+
+But the config only shows `vocab_size: 8` because that's the LLaMA backbone size!
+
+### config.json - What Each Field Means
+
+```json
+{
+  "architectures": ["ChatterboxT3"],    // Custom T3 model class
+  "model_type": "llama",                // Extends LLaMA (for vLLM compatibility)
+  "hidden_size": 2048,                   // CRITICAL: For CFG split [1024, 1024]
+  "vocab_size": 8                        // LLaMA backbone only (NOT working vocab!)
+}
+```
+
+**Important**: Don't change these values without understanding the full impact!
+
+### History of t3-model/config.json
+
+| Commit | Date | Change | Reason |
+|--------|------|--------|--------|
+| 337730b | Jun 2025 | Created as symlink | `../src/chatterbox_vllm/models/t3/config.json` |
+| d93dabc | Aug 2025 | Symlink → Regular file | Fix issue #12, vLLM compatibility |
+| This session | Mar 2028 | Broken, then restored | Misunderstanding of architecture → `git checkout` |
+
+### Common Pitfalls
+
+❌ **Wrong**: "vocab_size=8 doesn't match tokenizer (704), let me fix it"
+- Changes: `vocab_size: 704`
+- Result: Breaks LLaMA backbone loading
+
+❌ **Wrong**: "hidden_size=2048 seems large, let me match the model (1024)"
+- Changes: `hidden_size: 1024`
+- Result: CFG split fails (needs 2048)
+
+❌ **Wrong**: "architectures should be LlamaForCausalLM"
+- Changes: `architectures: ["LlamaForCausalLM"]`
+- Result: Doesn't recognize T3 custom components (cond_enc, etc.)
+
+✅ **Correct**: Use the config as-is, understand the architecture first
+- Result: Model loads and works correctly
+
+### Verification
+
+To verify the config is correct:
+
+```bash
+# Should generate real audio successfully
+CUDA_VISIBLE_DEVICES=0 uv run python simple_stream.py
+
+# Check output files
+ls output/*/full_audio.wav
+```
+
+**If you see**: `RuntimeError: split_with_sizes expects split_sizes to sum exactly to 1024`
+**Then**: Your `hidden_size` is wrong - should be 2048, not 1024
+
+**If you see**: `ValueError: Invalid repository ID`
+**Then**: Your config is missing or has wrong architecture/model_type
+
+### Key Takeaways
+
+1. **T3 has 3 embeddings**: `text_emb` (704/2454), `speech_emb` (8194), `tfmr.embed_tokens` (8)
+2. **vocab_size=8 is correct**: It's the LLaMA backbone, not the working vocab
+3. **hidden_size=2048 is critical**: Required for CFG split into cond/uncond embeddings
+4. **SPEECH_TOKEN_OFFSET=2500**: Distinguishes prefill from decode tokens
+5. **Effective vocab = 10694**: 2500 offset + 8194 speech tokens
+6. **Never modify config without understanding**: The original was carefully crafted
+
+### Related Files
+
+- `src/chatterbox_vllm/models/t3/t3.py` - T3 model implementation
+- `src/chatterbox_vllm/models/t3/modules/t3_config.py` - T3 configuration constants
+- `t3-model/config.json` - Model configuration (DO NOT MODIFY without understanding)
+- `ERROR_FIXED.md` - Issue #5: T3 Model Configuration Issues
+
+---

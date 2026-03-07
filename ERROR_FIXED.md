@@ -158,6 +158,96 @@ Final duration: 8.60s
 
 ---
 
+### 5. T3 Model Configuration Issues
+
+**Error**:
+```
+RuntimeError: split_with_sizes expects split_sizes to sum exactly to 1024 (input tensor's size at dimension 1), but got split_sizes=[1024, 1024]
+
+ValueError: Invalid repository ID or local directory specified: './t3-model'
+```
+
+**Root Cause**: Attempting to "fix" `t3-model/config.json` without understanding the T3 model's unique architecture.
+
+**The Misunderstanding**:
+1. Saw `vocab_size: 8` in the config and thought it was wrong (tokenizer has 704 tokens)
+2. Changed `hidden_size` from 2048 to 1024, breaking CFG (Classifier-Free Guidance)
+3. Changed `vocab_size` to match tokenizer size, breaking LLaMA backbone loading
+
+**The Reality: T3 Has THREE Separate Embeddings**
+
+The T3 model architecture uses **three different token embeddings**, not one:
+
+| Embedding | Vocab Size | Purpose |
+|-----------|-----------|---------|
+| `text_emb` | 704 (En) / 2454 (Multilingual) | **Input text tokens** from EnTokenizer |
+| `speech_emb` | 8194 | **Speech codec tokens** (EnCodec) for S3Gen |
+| `tfmr.embed_tokens` (LLaMA backbone) | 8 | Pre-trained LLaMA-520M base model |
+
+**Why vocab_size=8 is Correct**:
+- The `tfmr.embed_tokens` with vocab_size=8 is the **LLaMA backbone only**
+- T3 doesn't actually use this for text/speech
+- T3 uses custom embeddings (`text_emb` and `speech_emb`) instead
+- The config's vocab_size only describes the LLaMA backbone, NOT the working vocabulary
+
+**Why hidden_size=2048 is Critical**:
+```python
+# In t3.py forward method (line 691):
+cond_embeds, uncond_embeds = inputs_embeds.split([self.dim, self.dim], dim=1)
+```
+
+This requires 2048 dims total for CFG:
+- 1024 dims for conditional embeddings (speaker + audio prompt)
+- 1024 dims for unconditional embeddings (negative prompt)
+- CFG scale combines them: `cond_logits + cfg_scale * (cond_logits - uncond_logits)`
+
+**The SPEECH_TOKEN_OFFSET Trick**:
+```python
+SPEECH_TOKEN_OFFSET = 2500  # In t3.py line 49
+```
+
+- Tokens < 2500: Prefill tokens (conditionals, speaker embedding)
+- Tokens >= 2500: Speech generation tokens (2500 + actual token_id)
+- This allows distinguishing prefill from decode within the same sequence
+
+**Effective vocab_size for logits**:
+```python
+# In t3.py compute_logits (line 663-665):
+logits = torch.cat([
+    torch.zeros(logits.shape[0], SPEECH_TOKEN_OFFSET).fill_(-inf),  # 2500 fake dims
+    logits,  # 8194 speech tokens
+], dim=1)
+# Total: 2500 + 8194 = 10694 effective vocab
+```
+
+**Solution**:
+NEVER modify `t3-model/config.json` without understanding the full T3 architecture. The correct config is:
+
+```json
+{
+  "architectures": ["ChatterboxT3"],     // Custom T3 model class
+  "model_type": "llama",                // Extends LLaMA
+  "hidden_size": 2048,                   // CRITICAL: for CFG split
+  "vocab_size": 8                        // LLaMA backbone vocab only
+}
+```
+
+**History**:
+- **Commit 337730b** (Jun 2025): Originally a symlink to `../src/chatterbox_vllm/models/t3/config.json`
+- **Commit d93dabc** (Aug 2025): Converted to regular file (fix issue #12)
+- **This session**: Accidentally broke it by trying to "fix" it
+- **Fix**: `git checkout t3-model/config.json` to restore working version
+
+**Key Lesson**:
+> The T3 model's config.json describes the LLaMA backbone parameters, NOT the actual working vocabulary. The model uses custom embeddings and CFG which require specific values. Never modify it without deep understanding of the architecture.
+
+**Related**:
+- T3 model source: `src/chatterbox_vllm/models/t3/t3.py`
+- T3 config: `src/chatterbox_vllm/models/t3/modules/t3_config.py`
+- Design doc: `docs/plans/2026-03-07-s3gen-stream-pool-design.md`
+
+---
+
 ## Key Takeaways
 
 1. **Always set GPU visibility before CUDA operations**: When using `CUDA_VISIBLE_DEVICES`, set it at the very beginning of your Python script, not as a command prefix.
@@ -167,6 +257,8 @@ Final duration: 8.60s
 3. **API compatibility matters**: Use PyTorch core functions when possible, as they're more stable across versions than library-specific APIs.
 
 4. **Error messages can be misleading**: When debugging, run known-working code to isolate whether the issue is with your changes or the environment configuration.
+
+5. **T3 model architecture is complex**: The config.json describes the LLaMA backbone (vocab_size=8, hidden_size=2048), but the actual model uses custom embeddings with much larger effective vocabulary. Don't modify config without understanding the full architecture.
 
 ---
 
