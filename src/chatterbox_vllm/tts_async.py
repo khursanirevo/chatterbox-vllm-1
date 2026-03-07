@@ -500,15 +500,10 @@ class AsyncChatterboxTTS:
             print(f"[DEBUG] Starting generation at {t3_start_time:.3f}")
 
         # Stream tokens from AsyncLLMEngine
-        # Pass multi_modal_data via TextPrompt instead of as a parameter
-        # TextPrompt is a dict with 'prompt' and 'multi_modal_data' fields
-        prompt_with_conditionals = {
-            "prompt": text_normalized,
-            "multi_modal_data": {"conditionals": [cond_emb.detach()]}
-        }
-
+        # NOTE: Pass prompt as string to enable incremental token streaming
+        # Passing multi_modal_data causes vLLM to batch all tokens at once
         async for request_output in self.engine.generate(
-            prompt=prompt_with_conditionals,
+            prompt=text_normalized,
             sampling_params=sampling_params,
             request_id=request_id,
         ):
