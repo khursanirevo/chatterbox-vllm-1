@@ -82,3 +82,54 @@ async def test_build_token_context_context_larger_than_window(mock_s3gen):
     assert torch.equal(result, expected)
 
     await pool.shutdown()
+
+@pytest.mark.asyncio
+async def test_process_async_single_request(mock_s3gen):
+    """Test processing a single request through stream pool."""
+    pool = S3GenStreamPool(mock_s3gen, num_streams=4, device="cuda")
+    await pool.initialize()
+
+    token_chunk = torch.tensor([[1, 2, 3, 4, 5]])
+    s3gen_ref = {"embedding": torch.randn(1, 80)}
+
+    result = await pool.process_async(
+        token_chunk=token_chunk,
+        context_tokens=None,
+        s3gen_ref=s3gen_ref,
+        context_window=5,
+        fade_duration=0.02,
+        diffusion_steps=10,
+    )
+
+    assert result is not None
+    assert result.shape[0] == 1  # Batch dimension
+    assert pool.metrics.total_requests == 1
+    assert pool.metrics.active_streams == 0  # Released back to pool
+
+    await pool.shutdown()
+
+@pytest.mark.asyncio
+async def test_process_async_with_context(mock_s3gen):
+    """Test processing with context tokens."""
+    pool = S3GenStreamPool(mock_s3gen, num_streams=4, device="cuda")
+    await pool.initialize()
+
+    token_chunk = torch.tensor([[1, 2, 3]])
+    context_tokens = torch.tensor([10, 11, 12, 13, 14])
+    s3gen_ref = {"embedding": torch.randn(1, 80)}
+
+    # Mock should be called with concatenated tokens
+    mock_s3gen.inference.return_value = torch.randn(1, 24000)
+
+    result = await pool.process_async(
+        token_chunk=token_chunk,
+        context_tokens=context_tokens,
+        s3gen_ref=s3gen_ref,
+        context_window=5,
+    )
+
+    assert result is not None
+    # Verify inference was called
+    mock_s3gen.inference.assert_called_once()
+
+    await pool.shutdown()

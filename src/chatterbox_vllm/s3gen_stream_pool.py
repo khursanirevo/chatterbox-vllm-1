@@ -149,6 +149,83 @@ class S3GenStreamPool:
             # No context, return as-is
             return token_chunk
 
+    async def process_async(
+        self,
+        token_chunk: torch.Tensor,
+        context_tokens: Optional[torch.Tensor],
+        s3gen_ref: dict[str, Any],
+        context_window: int = 50,
+        fade_duration: float = 0.02,
+        diffusion_steps: int = 10,
+    ) -> Optional[torch.Tensor]:
+        """Process tokens through S3Gen on an available CUDA stream.
+
+        Args:
+            token_chunk: New tokens to process (1, T_new)
+            context_tokens: Optional context tokens for continuity
+            s3gen_ref: S3Gen reference dictionary
+            context_window: Context tokens to include for continuity
+            fade_duration: Fade-in duration in seconds
+            diffusion_steps: S3Gen diffusion steps
+
+        Returns:
+            Audio chunk tensor or None if processing failed
+        """
+        if self.stream_queue is None:
+            raise RuntimeError("Stream pool not initialized. Call initialize() first.")
+
+        # Step 1: Get stream from queue (fair FIFO)
+        queue_start = time.time()
+        stream = await self.stream_queue.get()
+        queue_wait_ms = (time.time() - queue_start) * 1000
+
+        # Track metrics
+        self.metrics.active_streams += 1
+        self.metrics.queue_depth = self.stream_queue.qsize()
+
+        try:
+            # Step 2: Run inference in thread pool (non-blocking)
+            loop = asyncio.get_event_loop()
+
+            def _inference_on_stream():
+                """Synchronous function to run in thread pool."""
+                with torch.cuda.stream(stream):
+                    # Build tokens with context
+                    tokens_to_process = self._build_token_context(
+                        token_chunk, context_tokens, context_window
+                    )
+
+                    # Run S3Gen inference (concurrent with other streams)
+                    audio = self.s3gen.inference(
+                        speech_tokens=tokens_to_process,
+                        ref_dict=s3gen_ref,
+                        finalize=False,
+                        n_timesteps=diffusion_steps,
+                    )
+
+                    return audio
+
+            # Submit to thread pool
+            audio_chunk = await loop.run_in_executor(
+                None,  # Use default executor
+                _inference_on_stream,
+            )
+
+            return audio_chunk
+
+        finally:
+            # Step 3: Always return stream to pool (even on error)
+            self.metrics.active_streams -= 1
+            await self.stream_queue.put(stream)
+
+            # Update metrics
+            self.metrics.total_requests += 1
+            if self.metrics.total_requests > 0:
+                self.metrics.avg_queue_wait_ms = (
+                    (self.metrics.avg_queue_wait_ms * (self.metrics.total_requests - 1) + queue_wait_ms)
+                    / self.metrics.total_requests
+                )
+
     async def __aenter__(self) -> "S3GenStreamPool":
         """Async context manager entry."""
         await self.initialize()
