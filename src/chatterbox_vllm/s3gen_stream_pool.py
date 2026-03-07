@@ -105,6 +105,50 @@ class S3GenStreamPool:
 
         logger.info(f"S3GenStreamPool shutdown. Total requests: {self.metrics.total_requests}")
 
+    def _build_token_context(
+        self,
+        token_chunk: torch.Tensor,
+        context_tokens: Optional[torch.Tensor],
+        context_window: int,
+    ) -> torch.Tensor:
+        """Build tokens with context window for continuity.
+
+        Args:
+            token_chunk: New tokens to process (1, T_new)
+            context_tokens: Optional context tokens for continuity
+            context_window: How many context tokens to include
+
+        Returns:
+            Tensor with shape (1, T_context + T_new)
+        """
+        if context_tokens is not None and len(context_tokens) > 0:
+            # Ensure context_tokens is 1D for slicing
+            if context_tokens.dim() > 1:
+                ctx_tokens = context_tokens.squeeze(0)
+            else:
+                ctx_tokens = context_tokens
+
+            # Take last N tokens from context (or all if less than window)
+            ctx_window = (
+                ctx_tokens[-context_window:]
+                if len(ctx_tokens) > context_window
+                else ctx_tokens
+            )
+
+            # Ensure token_chunk is 1D for concatenation
+            chunk_1d = (
+                token_chunk.squeeze(0)
+                if token_chunk.dim() > 1
+                else token_chunk
+            )
+
+            # Concatenate context + new chunk
+            tokens_to_process = torch.cat([ctx_window, chunk_1d], dim=-1).unsqueeze(0)
+            return tokens_to_process
+        else:
+            # No context, return as-is
+            return token_chunk
+
     async def __aenter__(self) -> "S3GenStreamPool":
         """Async context manager entry."""
         await self.initialize()
