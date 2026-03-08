@@ -720,7 +720,7 @@ CUDA_VISIBLE_DEVICES=0 uv run python test_profiling.py simple
 | `test-profiling.py` | `test_profiling.py simple` |
 | `test-profiling-first-chunk.py` | `test_profiling.py first-chunk` |
 | `test-profiling-steady-state.py` | `test_profiling.py steady-state` |
-| `test-generate-sizes.py`, `test-async-*.py`, `test-concurrent-*.py` | `test_benchmark.py` (modes: generate, async, concurrent) |
+| `test-generate-sizes.py`, `test-async-*.py`, `test-concurrent-*.py` | `test_benchmark.py` (modes: generate, async, burst) |
 
 ### New Unified Tools
 
@@ -741,7 +741,7 @@ CUDA_VISIBLE_DEVICES=0 uv run python test_profiling.py simple
    ```bash
    uv run python test_benchmark.py generate
    uv run python test_benchmark.py async
-   uv run python test_benchmark.py concurrent --burst-sizes 4 8 16
+   uv run python test_benchmark.py burst --burst-sizes 4 8 16
    ```
 
 ### Git Commits
@@ -1019,13 +1019,13 @@ async with websockets.connect("ws://localhost:8000/ws/tts") as ws:
 
 ---
 
-## Session: 2026-03-08 - Bytes Serialization & Concurrent Mode Fixes
+## Session: 2026-03-08 - Bytes Serialization & Burst Mode
 
 ### Objective
 
 1. Serialize audio to bytes **before yielding** to accurately measure time until audio is ready for transmission
 2. Save files using `wave` library instead of torchaudio (no tensor conversion)
-3. Fix concurrent mode to work reliably with ChatterboxTTS
+3. Implement burst mode for sequential request processing (renamed from "concurrent" for clarity)
 
 ### Changes Made
 
@@ -1117,14 +1117,20 @@ for i, chunk_bytes in enumerate(audio_chunks):
 }
 ```
 
-#### 4. Fixed Concurrent Mode
+#### 4. Burst Mode (Sequential Processing)
 
-**Problem:** `ThreadPoolExecutor` caused deadlocks because vLLM's `LLM` class is not thread-safe
+**Why "burst" instead of "concurrent"?**
 
-**Solution:** Process requests sequentially (vLLM handles internal batching)
+The original implementation used `ThreadPoolExecutor` which caused deadlocks because vLLM's `LLM` class is not thread-safe. The solution was to process requests **sequentially**, not concurrently. The mode was renamed from "concurrent" to "burst" to accurately reflect this behavior.
 
+**Key insight:** Processing requests one at a time still provides valuable metrics for:
+- **Throughput testing** - How many requests/second can the system handle?
+- **Burst traffic simulation** - How does the system handle back-to-back requests?
+- **Warmup effects** - Performance after model is warmed up
+
+**Processing model:**
 ```python
-# Before (broken):
+# Before (broken - ThreadPoolExecutor):
 with ThreadPoolExecutor(max_workers=burst_size) as executor:
     futures = []
     for i in range(burst_size):
@@ -1133,11 +1139,16 @@ with ThreadPoolExecutor(max_workers=burst_size) as executor:
     for future in futures:
         result = future.result()
 
-# After (working):
+# After (working - sequential):
 for i in range(burst_size):
     result = process_single_request(...)
     results.results.append(result)
 ```
+
+**Sequential processing means:**
+- Request 1 completes before Request 2 starts
+- 8 requests take ~8 seconds (not ~1 second if truly concurrent)
+- Throughput ≈ 1 request/second (not 8 requests/second)
 
 ### Timeline for `latency_to_first_chunk`
 
@@ -1161,21 +1172,24 @@ for i in range(burst_size):
 - **Sample rate**: 24000 Hz
 - **Channels**: Mono (1 channel)
 
-### Concurrent Mode Performance
+### Burst Mode Performance
 
-| Burst Size | Avg TTFA | Median | 95th | <1s % |
-|------------|----------|--------|------|-------|
-| 1 | 1044ms | 1044ms | 1044ms | 0% |
-| 2 | 857ms | 857ms | 919ms | 100% |
-| 8 | 867ms | 875ms | 992ms | 100% |
-| 32 | 991ms | 993ms | 1140ms | 53% |
+| Burst Size | Avg TTFA | Median | 95th | <1s % | Throughput (req/s) | Duration (s) |
+|------------|----------|--------|------|-------|---------------------|---------------|
+| 1 | 1044ms | 1044ms | 1044ms | 0% | ~0.96 | ~1.04 |
+| 2 | 857ms | 857ms | 919ms | 100% | ~0.95 | ~2.11 |
+| 8 | 868ms | 875ms | 992ms | 100% | ~1.00 | ~8.03 |
+| 32 | 991ms | 993ms | 1140ms | 53% | ~0.97 | ~33.0 |
+
+**Note:** Duration scales linearly with burst size because requests are processed sequentially.
 
 ### Key Findings
 
-1. **Serialization time is negligible** - Only 0.2-0.3ms
+1. **Serialization time is negligible** - Only 0.2-0.3ms overhead
 2. **Wave library saves bytes directly** - No tensor conversion needed
-3. **Sequential processing works reliably** - vLLM handles internal batching
+3. **Sequential processing is explicit** - Throughput and duration metrics make this clear
 4. **Metadata provides complete timing breakdown** - All metrics saved for analysis
+5. **Burst mode tests throughput capacity** - How many requests/second can the system handle?
 
 ### Files Modified
 
@@ -1188,7 +1202,9 @@ for i in range(burst_size):
    - Added `wave` import
    - Added `bytes_to_tensor()` helper
    - Updated `save_audio_outputs()` to use `wave` library
-   - Removed `ThreadPoolExecutor` from concurrent mode
+   - Renamed `concurrent` mode to `burst` mode
+   - Removed `ThreadPoolExecutor` (process sequentially)
+   - Added burst metrics: duration, throughput, avg request time
    - Enhanced metadata with all timing metrics
 
 ### Usage Examples
@@ -1197,11 +1213,14 @@ for i in range(burst_size):
 # Generate mode (always saves audio chunks, full audio, text, metadata)
 uv run python test_benchmark.py generate --output-dir output/my_test
 
-# Concurrent mode (saves when --save-audio is specified)
-uv run python test_benchmark.py concurrent --burst-sizes 8 --save-audio
+# Burst mode - tests sequential request processing
+uv run python test_benchmark.py burst --burst-sizes 8
 
-# Concurrent mode with custom output directory
-uv run python test_benchmark.py concurrent --burst-sizes 32 --save-audio --output-dir output/test_32
+# Burst mode with audio saving
+uv run python test_benchmark.py burst --burst-sizes 8 --save-audio
+
+# Burst mode with custom output directory
+uv run python test_benchmark.py burst --burst-sizes 32 --save-audio --output-dir output/test_32
 ```
 
 ### Output Structure
