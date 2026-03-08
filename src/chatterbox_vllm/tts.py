@@ -40,6 +40,7 @@ class StreamingMetrics:
     t3_first_token_time: float = 0.0  # Time to first speech token
     s3gen_first_chunk_time: float = 0.0  # Time for first S3Gen chunk
     first_s3gen_inference_time: float = 0.0  # Actual inference time for first chunk
+    first_serialization_time: float = 0.0  # Time to serialize first chunk to bytes
 
     # Per-chunk timing (updated for each chunk)
     last_chunk_time: float = 0.0
@@ -477,9 +478,9 @@ class ChatterboxTTS:
         top_p: float = 1.0,
         repetition_penalty: float = 2.0,
         *args, **kwargs,
-    ) -> Generator[Tuple[torch.Tensor, StreamingMetrics], None, None]:
+    ) -> Generator[Tuple[bytes, StreamingMetrics], None, None]:
         """
-        Generate streaming audio from text, yielding chunks as they're synthesized.
+        Generate streaming audio from text, yielding chunks as bytes.
 
         This method generates all speech tokens using vLLM (fast), then streams
         them through S3Gen incrementally for real-time audio playback.
@@ -501,14 +502,14 @@ class ChatterboxTTS:
             *args, **kwargs: Additional vLLM SamplingParams arguments
 
         Yields:
-            Tuple of (audio_chunk, metrics) where:
-            - audio_chunk: torch.Tensor of shape (1, T) audio samples
+            Tuple of (audio_bytes, metrics) where:
+            - audio_bytes: Raw audio bytes (16-bit PCM, 24kHz)
             - metrics: StreamingMetrics with timing information
 
         Example:
-            >>> for audio_chunk, metrics in model.generate_stream("Hello world"):
-            ...     # Play or save audio_chunk
-            ...     print(f"Chunk {metrics.chunk_count}: {audio_chunk.shape}")
+            >>> for audio_bytes, metrics in model.generate_stream("Hello world"):
+            ...     # Play or save audio_bytes
+            ...     print(f"Chunk {metrics.chunk_count}: {len(audio_bytes)} bytes")
         """
         start_time = time.time()
         metrics = StreamingMetrics()
@@ -591,16 +592,8 @@ class ChatterboxTTS:
 
                 # Update metrics
                 if metrics.chunk_count == 0:
-                    metrics.latency_to_first_chunk = time.time() - start_time
                     metrics.s3gen_first_chunk_time = time.time() - chunk_start
                     metrics.first_s3gen_inference_time = s3gen_time
-                    if print_metrics:
-                        print(f"\n[PROFILE] First Audio Chunk Breakdown:")
-                        print(f"  - Text tokenization: {metrics.text_tokenization_time*1000:.2f}ms")
-                        print(f"  - T3 token generation: {metrics.t3_token_generation_time:.2f}s")
-                        print(f"  - First S3Gen chunk: {metrics.s3gen_first_chunk_time*1000:.2f}ms")
-                        print(f"    - S3Gen inference: {metrics.first_s3gen_inference_time*1000:.2f}ms")
-                        print(f"  - Total latency to first chunk: {metrics.latency_to_first_chunk:.3f}s")
 
                 metrics.chunk_count += 1
                 chunk_time = time.time() - chunk_start
@@ -608,10 +601,34 @@ class ChatterboxTTS:
                 metrics.last_chunk_time = chunk_time
                 metrics.avg_chunk_time = sum(chunk_times) / len(chunk_times)
 
-                # Yield if we got audio
+                # Serialize to bytes and yield if we got audio
                 if audio_chunk is not None:
                     metrics.total_audio_duration += audio_chunk.shape[-1] / S3GEN_SR
-                    yield audio_chunk.cpu(), metrics
+
+                    # Move to CPU and serialize to bytes
+                    serialize_start = time.time()
+                    audio_cpu = audio_chunk.cpu()
+                    # Convert to 16-bit PCM bytes
+                    audio_bytes = (audio_cpu * 32767).clamp(-32768, 32767).short().numpy().tobytes()
+                    serialize_time = time.time() - serialize_start
+
+                    # Record serialization time for first chunk
+                    if metrics.chunk_count == 1:
+                        metrics.first_serialization_time = serialize_time
+
+                    # Latency to first chunk now includes serialization
+                    if metrics.chunk_count == 1:
+                        metrics.latency_to_first_chunk = time.time() - start_time
+                        if print_metrics:
+                            print(f"\n[PROFILE] First Audio Chunk Breakdown:")
+                            print(f"  - Text tokenization: {metrics.text_tokenization_time*1000:.2f}ms")
+                            print(f"  - T3 token generation: {metrics.t3_token_generation_time:.2f}s")
+                            print(f"  - First S3Gen chunk: {metrics.s3gen_first_chunk_time*1000:.2f}ms")
+                            print(f"    - S3Gen inference: {metrics.first_s3gen_inference_time*1000:.2f}ms")
+                            print(f"  - First serialization: {metrics.first_serialization_time*1000:.2f}ms")
+                            print(f"  - Total latency to first chunk: {metrics.latency_to_first_chunk:.3f}s")
+
+                    yield audio_bytes, metrics
 
                 # Update processed tokens
                 all_tokens_processed = torch.cat([all_tokens_processed, chunk.squeeze(0)], dim=0)
