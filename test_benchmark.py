@@ -556,10 +556,10 @@ def process_single_request(
     )
 
 
-def mode_concurrent(args):
-    """Test concurrent request handling."""
+def mode_burst(args):
+    """Test sequential burst request handling."""
     print("=" * 70)
-    print("CONCURRENT MODE - Burst Testing")
+    print("BURST MODE - Sequential Burst Testing")
     print("=" * 70)
 
     burst_sizes = args.burst_sizes or [1, 4, 8]
@@ -596,13 +596,13 @@ def mode_concurrent(args):
 
     for burst_size in burst_sizes:
         print(f"\n{'#'*70}")
-        print(f"# BURST SIZE: {burst_size} CONCURRENT REQUESTS")
+        print(f"# BURST SIZE: {burst_size} REQUESTS (SEQUENTIAL PROCESSING)")
         print(f"{'#'*70}")
 
         results = BurstTestResults(burst_size=burst_size)
         burst_start = time.time()
 
-        # Process requests sequentially (ThreadPoolExecutor causes deadlocks with vLLM)
+        # Process requests sequentially
         for i in range(burst_size):
             text = texts[i % len(texts)]
             result = process_single_request(
@@ -620,6 +620,11 @@ def mode_concurrent(args):
                   f"TTFA={result.first_chunk_time*1000:7.2f}ms, "
                   f"Total={result.total_time*1000:7.2f}ms")
 
+        # Calculate burst metrics
+        burst_end = time.time()
+        burst_duration = burst_end - burst_start
+        throughput = burst_size / burst_duration
+
         # Print results
         print(f"\n{'='*70}")
         print(f"RESULTS: {burst_size} REQUESTS")
@@ -627,6 +632,11 @@ def mode_concurrent(args):
         print(f"\nSuccess: {results.successful_count}/{results.burst_size}")
 
         if results.successful_count > 0:
+            print(f"\n⏱️  BURST METRICS:")
+            print(f"  Burst duration:      {burst_duration:.2f}s")
+            print(f"  Throughput:          {throughput:.2f} requests/second")
+            print(f"  Avg request time:    {burst_duration/burst_size:.2f}s")
+
             print(f"\n⚡ FIRST CHUNK LATENCY:")
             print(f"  Average:   {results.avg_first_chunk*1000:7.2f}ms")
             print(f"  Min:       {results.min_first_chunk*1000:7.2f}ms")
@@ -645,15 +655,20 @@ def mode_concurrent(args):
     print("BURST SIZE COMPARISON SUMMARY")
     print("=" * 70)
 
-    print(f"\n{'Burst':<10} {'Avg TTFA':<12} {'Median':<12} {'95th':<12} {'<1s':<10}")
-    print("-" * 60)
+    print(f"\n{'Burst':<10} {'Avg TTFA':<12} {'Throughput':<15} {'Duration':<12} {'<1s':<10}")
+    print("-" * 65)
 
     for burst_size in burst_sizes:
         if burst_size in all_results:
             r = all_results[burst_size]
+            # Calculate approximate throughput from results
+            first_start = r.results[0].start_time if r.results else 0
+            last_end = r.results[-1].end_time if r.results else 0
+            duration = last_end - first_start
+            throughput = burst_size / duration if duration > 0 else 0
+
             print(f"{burst_size:<10} {r.avg_first_chunk*1000:<12.1f} "
-                  f"{r.median_first_chunk*1000:<12.1f} {r.p95_first_chunk*1000:<12.1f} "
-                  f"{r.under_1s_pct:<10.0f}%")
+                  f"{throughput:<15.2f} {duration:<12.2f} {r.under_1s_pct:<10.0f}%")
 
     model.shutdown()
     print("\nDone!")
@@ -676,14 +691,14 @@ Examples:
   # Test async token streaming
   uv run python test_benchmark.py async
 
-  # Test concurrent requests
-  uv run python test_benchmark.py concurrent --burst-sizes 4 8 16
+  # Test sequential burst requests
+  uv run python test_benchmark.py burst --burst-sizes 4 8 16
 
-  # Test concurrent and save audio chunks, full audio, and text
-  uv run python test_benchmark.py concurrent --burst-sizes 4 --save-audio
+  # Test burst and save audio chunks, full audio, and text
+  uv run python test_benchmark.py burst --burst-sizes 4 --save-audio
 
   # Test with unique texts (no prefix caching) and save audio
-  uv run python test_benchmark.py concurrent --unique --burst-sizes 8 16 --save-audio
+  uv run python test_benchmark.py burst --unique --burst-sizes 8 16 --save-audio
         """
     )
 
@@ -699,16 +714,16 @@ Examples:
     # Async mode
     async_parser = subparsers.add_parser("async", help="Test AsyncLLMEngine streaming")
 
-    # Concurrent mode
-    concurrent_parser = subparsers.add_parser("concurrent", help="Test concurrent request handling")
-    concurrent_parser.add_argument("--burst-sizes", type=int, nargs="+", default=[1, 4, 8],
-                                  help="Burst sizes to test")
-    concurrent_parser.add_argument("--unique", action="store_true",
-                                  help="Use unique texts (no prefix caching)")
-    concurrent_parser.add_argument("--output-dir", type=str, default="output/concurrent",
-                                  help="Output directory for audio and text")
-    concurrent_parser.add_argument("--save-audio", action="store_true",
-                                  help="Save audio chunks, full audio, and text")
+    # Burst mode (sequential processing)
+    burst_parser = subparsers.add_parser("burst", help="Test sequential burst request handling")
+    burst_parser.add_argument("--burst-sizes", type=int, nargs="+", default=[1, 4, 8],
+                              help="Burst sizes to test")
+    burst_parser.add_argument("--unique", action="store_true",
+                              help="Use unique texts (no prefix caching)")
+    burst_parser.add_argument("--output-dir", type=str, default="output/burst",
+                              help="Output directory for audio and text")
+    burst_parser.add_argument("--save-audio", action="store_true",
+                              help="Save audio chunks, full audio, and text")
 
     args = parser.parse_args()
 
@@ -724,8 +739,8 @@ Examples:
         mode_generate(args)
     elif args.mode == "async":
         asyncio.run(mode_async(args))
-    elif args.mode == "concurrent":
-        mode_concurrent(args)
+    elif args.mode == "burst":
+        mode_burst(args)
     else:
         parser.print_help()
 
